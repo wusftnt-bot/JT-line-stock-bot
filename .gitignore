@@ -1,0 +1,5 @@
+﻿.cache/
+.sent/
+__pycache__/
+*.pyc
+reports/

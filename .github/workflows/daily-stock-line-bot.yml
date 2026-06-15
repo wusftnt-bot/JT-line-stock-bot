@@ -1,0 +1,190 @@
+name: daily-ai-stock-line-bot
+
+on:
+  workflow_dispatch:
+    inputs:
+      allow_latest_available_data:
+        description: "Manual test only: bypass the 14:30 close-data guard and use latest available market data."
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+  schedule:
+    # 19:30 Asia/Taipei. GitHub Actions schedules use UTC.
+    - cron: "30 11 * * 1-5"
+
+jobs:
+  stock-selection-line-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      ENABLE_LINE_PUSH: "true"
+      LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.AI_POWERED_STOCK }}
+      LINE_TO: ${{ secrets.LINE_TO }}
+      AI_STOCK_TOP_LIMIT: "10"
+      AI_STOCK_CANDIDATE_LIMIT: "50"
+      AI_STOCK_INSTITUTIONAL_CANDIDATE_LIMIT: "50"
+      AI_STOCK_INSTITUTIONAL_CANDIDATE_MIN_SCORE: "22"
+      AI_STOCK_MIN_YOY: "20"
+      AI_STOCK_MIN_MOM: "0"
+      AI_STOCK_MIN_ACC_YOY: "15"
+      AI_STOCK_EXCLUDE_FINANCIAL: "false"
+      AI_STOCK_MOPS_RETRY: "4"
+      AI_STOCK_MOPS_TIMEOUT_SEC: "45"
+      AI_STOCK_REVENUE_CACHE_MAX_AGE_HOURS: "36"
+      AI_STOCK_REVENUE_ANOMALY_FILTER: "true"
+      AI_STOCK_MAX_YOY: "350"
+      AI_STOCK_MAX_MOM: "180"
+      AI_STOCK_HARD_MAX_YOY: "800"
+      AI_STOCK_MIN_REVENUE_BASE: "50000"
+      AI_STOCK_MIN_MONTHLY_REVENUE: "80000"
+      AI_STOCK_MIN_INDUSTRY_PEERS: "3"
+      AI_STOCK_MAX_PER_INDUSTRY: "2"
+      AI_STOCK_MAX_PER_THEME: "2"
+      AI_STOCK_TOP_MIN_AVG_VOLUME_LOTS: "1500"
+      AI_STOCK_TOP_MIN_LATEST_VOLUME_LOTS: "800"
+      AI_STOCK_TOP_MIN_20D_TURNOVER_TWD: "100000000"
+      AI_STOCK_TOP_MIN_MODEL_SCORE: "65"
+      AI_STOCK_TOP_MIN_VOLUME_RATIO: "0.60"
+      AI_STOCK_TOP_MAX_VOLUME_RATIO: "3.00"
+      AI_STOCK_TOP_MIN_CLOSE: "15"
+      AI_STOCK_TOP_MAX_1D_DROP: "-4.0"
+      AI_STOCK_TOP_MAX_20D_PRICE_CHANGE: "35"
+      AI_STOCK_TOP_QUALITY_STRICT: "false"
+      AI_STOCK_WATCH_LIMIT: "5"
+      AI_STOCK_WATCH_MIN_MODEL_SCORE: "55"
+      AI_STOCK_OPPORTUNITY_LIMIT: "5"
+      AI_STOCK_OPPORTUNITY_MIN_SCORE: "58"
+      AI_STOCK_OPPORTUNITY_MAX_20D_PRICE_CHANGE: "30"
+      AI_STOCK_OPPORTUNITY_MIN_LATEST_VOLUME_LOTS: "300"
+      AI_STOCK_OPPORTUNITY_MIN_CLOSE: "10"
+      AI_STOCK_RADAR_LIMIT: "5"
+      AI_STOCK_RADAR_MIN_SCORE: "55"
+      AI_STOCK_RADAR_MAX_20D_PRICE_CHANGE: "25"
+      AI_STOCK_RADAR_MIN_VOLUME_RATIO: "0.50"
+      AI_STOCK_RADAR_MIN_LATEST_VOLUME_LOTS: "300"
+      AI_STOCK_RADAR_MIN_CLOSE: "10"
+      AI_STOCK_RADAR_MAX_1D_DROP: "-6.0"
+      AI_STOCK_RADAR_LIMIT_DOWN_THRESHOLD: "-9.0"
+      AI_STOCK_RADAR_FOREIGN_BIG_SELL_LOTS: "1000"
+      AI_STOCK_RADAR_FOREIGN_BIG_SELL_AVG_VOLUME_RATIO: "0.05"
+      AI_STOCK_RADAR_LOSS_HIGH_GROWTH_YOY: "40"
+      AI_STOCK_RADAR_MIN_INDUSTRY_PRIORITY: "8"
+      AI_STOCK_MARKET_PROXY: "0050"
+      AI_STOCK_EXIT_ALERT_LIMIT: "5"
+      AI_STOCK_EXIT_ALERT_LOOKBACK_DAYS: "20"
+      AI_STOCK_EXIT_ALERT_MAX_1D_DROP: "-6.0"
+      AI_STOCK_LINE_TOP_DISPLAY_LIMIT: "5"
+      AI_STOCK_LINE_OPPORTUNITY_DISPLAY_LIMIT: "3"
+      AI_STOCK_LINE_WATCH_DISPLAY_LIMIT: "3"
+      AI_STOCK_LINE_RADAR_DISPLAY_LIMIT: "3"
+      AI_STOCK_LINE_EXIT_DISPLAY_LIMIT: "3"
+      AI_STOCK_ALLOW_INCOMPLETE_DATA_PUSH: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_latest_available_data == 'true' && 'true' || 'false' }}
+      AI_STOCK_MIN_AVG_VOLUME_LOTS: "500"
+      AI_STOCK_VALUATION_NEUTRAL_SCORE: "6"
+      AI_STOCK_VALUATION_EPS_ANNUALIZE_FACTOR: "4"
+      AI_STOCK_FINANCIAL_NEUTRAL_SCORE: "6"
+      AI_STOCK_CASH_FLOW_NEUTRAL_SCORE: "3"
+      AI_STOCK_FINMIND_FUNDAMENTAL_LIMIT: "10"
+      AI_STOCK_TRACKER_MAX_PER_RUN: "30"
+      AI_STOCK_MARGIN_RISK_RATIO: "0.20"
+      LINE_BROADCAST: "false"
+      DAILY_FINANCE_REPORT_URL: "https://wusftnt-bot.github.io/daily-finance-report/"
+      FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve Taipei date
+        id: taipei
+        shell: bash
+        run: |
+          today="$(TZ=Asia/Taipei date +%F)"
+          echo "today=$today" >> "$GITHUB_OUTPUT"
+          echo "sent_marker=.sent/line/line-stock-$today.txt" >> "$GITHUB_OUTPUT"
+          echo "sent_cache_key=line-stock-$today" >> "$GITHUB_OUTPUT"
+          echo "data_cache_prefix=ai-stock-data-cache-" >> "$GITHUB_OUTPUT"
+
+      - name: Restore sent marker
+        id: sent-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ steps.taipei.outputs.sent_marker }}
+          key: ${{ steps.taipei.outputs.sent_cache_key }}
+
+      - name: Check sent marker
+        id: sent
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "${{ steps.sent-cache.outputs.cache-hit }}" = "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "LINE stock bot already sent today via cache marker."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore AI stock data cache
+        if: steps.sent.outputs.skip != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: .cache/line-ai-stock-bot
+          key: ${{ steps.taipei.outputs.data_cache_prefix }}${{ steps.taipei.outputs.today }}
+          restore-keys: |
+            ${{ steps.taipei.outputs.data_cache_prefix }}
+
+      - name: Set up Python
+        if: steps.sent.outputs.skip != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run AI stock bot and push LINE message
+        if: steps.sent.outputs.skip != 'true'
+        shell: bash
+        env:
+          AI_STOCK_DATA_CACHE_DIR: .cache/line-ai-stock-bot
+        run: |
+          start_ts=$(date +%s)
+          python scripts/ai_stock_bot.py --push-line
+          end_ts=$(date +%s)
+          elapsed=$((end_ts - start_ts))
+          elapsed_text="$((elapsed / 60))m $((elapsed % 60))s"
+          echo "AI_STOCK_WORKFLOW_RUNTIME elapsed_seconds=$elapsed elapsed=$elapsed_text"
+          {
+            echo "### AI stock bot runtime"
+            echo "- Elapsed: $elapsed_text"
+            echo "- Candidate target: fundamental ${AI_STOCK_CANDIDATE_LIMIT} + institutional ${AI_STOCK_INSTITUTIONAL_CANDIDATE_LIMIT}"
+            echo "- Finished UTC: $(date -u -Iseconds)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create sent marker
+        if: steps.sent.outputs.skip != 'true'
+        shell: bash
+        run: |
+          mkdir -p "$(dirname "${{ steps.taipei.outputs.sent_marker }}")"
+          {
+            echo "daily-ai-stock-line-bot"
+            echo "date=${{ steps.taipei.outputs.today }}"
+            echo "sent_at_utc=$(date -u -Iseconds)"
+            echo "run_id=${{ github.run_id }}"
+            echo "event=${{ github.event_name }}"
+          } > "${{ steps.taipei.outputs.sent_marker }}"
+
+      - name: Save sent marker
+        if: steps.sent.outputs.skip != 'true'
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: ${{ steps.taipei.outputs.sent_marker }}
+          key: ${{ steps.taipei.outputs.sent_cache_key }}
+
+      - name: Save AI stock data cache
+        if: steps.sent.outputs.skip != 'true'
+        uses: actions/cache/save@v4
+        continue-on-error: true
+        with:
+          path: .cache/line-ai-stock-bot
+          key: ${{ steps.taipei.outputs.data_cache_prefix }}${{ steps.taipei.outputs.today }}-${{ github.run_id }}

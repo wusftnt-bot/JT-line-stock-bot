@@ -1,0 +1,80 @@
+name: line-stock-watchdog
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 19:40 Asia/Taipei. GitHub Actions schedules use UTC.
+    - cron: "40 11 * * 1-5"
+
+jobs:
+  ensure-line-stock-run:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Check and backfill stock workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          WORKFLOW_FILE: daily-stock-line-bot.yml
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.request
+          from datetime import datetime, time, timezone
+
+          token = os.environ["GH_TOKEN"]
+          repo = os.environ["REPO"]
+          workflow_file = os.environ["WORKFLOW_FILE"]
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+              "Content-Type": "application/json",
+              "User-Agent": "line-stock-watchdog",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
+
+          def request(method: str, path: str, data: bytes | None = None):
+              url = f"https://api.github.com/repos/{repo}{path}"
+              req = urllib.request.Request(url, data=data, headers=headers, method=method)
+              with urllib.request.urlopen(req, timeout=45) as response:
+                  body = response.read().decode("utf-8")
+                  return json.loads(body) if body else {}
+
+          now = datetime.now(timezone.utc)
+          window_start = datetime.combine(now.date(), time(11, 25), tzinfo=timezone.utc)
+          runs = request("GET", f"/actions/workflows/{workflow_file}/runs?per_page=20").get("workflow_runs", [])
+
+          matching = []
+          for run in runs:
+              created = datetime.fromisoformat(run["created_at"].replace("Z", "+00:00"))
+              if created >= window_start and run.get("event") in {"schedule", "workflow_dispatch"}:
+                  matching.append(run)
+
+          healthy = [
+              run for run in matching
+              if run.get("status") in {"queued", "in_progress"}
+              or (run.get("status") == "completed" and run.get("conclusion") == "success")
+          ]
+          if healthy:
+              best = healthy[0]
+              print(
+                  "LINE_STOCK_WATCHDOG ok "
+                  f"run_id={best.get('id')} status={best.get('status')} "
+                  f"conclusion={best.get('conclusion')} created_at={best.get('created_at')}"
+              )
+              sys.exit(0)
+
+          payload = json.dumps({"ref": "main"}).encode("utf-8")
+          request("POST", f"/actions/workflows/{workflow_file}/dispatches", payload)
+          failed = [
+              f"{run.get('id')}:{run.get('status')}:{run.get('conclusion')}"
+              for run in matching[:5]
+          ]
+          print("LINE_STOCK_WATCHDOG dispatched backup run; prior=" + ",".join(failed))
+          PY
