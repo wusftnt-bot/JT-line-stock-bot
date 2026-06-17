@@ -12,8 +12,9 @@ on:
           - "false"
           - "true"
   schedule:
-    # 19:30 Asia/Taipei. GitHub Actions schedules use UTC.
-    - cron: "30 11 * * 1-5"
+    # 19:20/19:35/19:50 Asia/Taipei. GitHub Actions schedules use UTC.
+    # Multiple slots reduce schedule-delay risk; sent marker prevents duplicate pushes.
+    - cron: "20,35,50 11 * * 1-5"
 
 jobs:
   stock-selection-line-push:
@@ -103,13 +104,28 @@ jobs:
         shell: bash
         run: |
           today="$(TZ=Asia/Taipei date +%F)"
+          hm="$(TZ=Asia/Taipei date +%H%M)"
           echo "today=$today" >> "$GITHUB_OUTPUT"
+          echo "hm=$hm" >> "$GITHUB_OUTPUT"
           echo "sent_marker=.sent/line/line-stock-$today.txt" >> "$GITHUB_OUTPUT"
           echo "sent_cache_key=line-stock-$today" >> "$GITHUB_OUTPUT"
           echo "data_cache_prefix=ai-stock-data-cache-" >> "$GITHUB_OUTPUT"
 
+      - name: Guard scheduled push window
+        id: push-window
+        shell: bash
+        run: |
+          hm="${{ steps.taipei.outputs.hm }}"
+          if [ "${{ github.event_name }}" = "schedule" ] && { [ "$hm" -lt 1915 ] || [ "$hm" -gt 2010 ]; }; then
+            echo "allowed=false" >> "$GITHUB_OUTPUT"
+            echo "LINE stock bot schedule fired outside Taipei push window; skip push. taipei_hm=$hm"
+          else
+            echo "allowed=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Restore sent marker
         id: sent-cache
+        if: steps.push-window.outputs.allowed == 'true'
         uses: actions/cache/restore@v4
         with:
           path: ${{ steps.taipei.outputs.sent_marker }}
@@ -117,6 +133,7 @@ jobs:
 
       - name: Check sent marker
         id: sent
+        if: steps.push-window.outputs.allowed == 'true'
         shell: bash
         run: |
           if [ "${{ github.event_name }}" = "schedule" ] && [ "${{ steps.sent-cache.outputs.cache-hit }}" = "true" ]; then
@@ -127,7 +144,7 @@ jobs:
           fi
 
       - name: Restore AI stock data cache
-        if: steps.sent.outputs.skip != 'true'
+        if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true'
         uses: actions/cache/restore@v4
         with:
           path: .cache/line-ai-stock-bot
@@ -136,13 +153,13 @@ jobs:
             ${{ steps.taipei.outputs.data_cache_prefix }}
 
       - name: Set up Python
-        if: steps.sent.outputs.skip != 'true'
+        if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Run AI stock bot and push LINE message
-        if: steps.sent.outputs.skip != 'true'
+        if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true'
         shell: bash
         env:
           AI_STOCK_DATA_CACHE_DIR: .cache/line-ai-stock-bot
@@ -161,7 +178,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Create sent marker
-        if: steps.sent.outputs.skip != 'true'
+        if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true'
         shell: bash
         run: |
           mkdir -p "$(dirname "${{ steps.taipei.outputs.sent_marker }}")"
@@ -174,7 +191,7 @@ jobs:
           } > "${{ steps.taipei.outputs.sent_marker }}"
 
       - name: Save sent marker
-        if: steps.sent.outputs.skip != 'true'
+        if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true'
         uses: actions/cache/save@v4
         continue-on-error: true
         with:
@@ -182,7 +199,7 @@ jobs:
           key: ${{ steps.taipei.outputs.sent_cache_key }}
 
       - name: Save AI stock data cache
-        if: steps.sent.outputs.skip != 'true'
+        if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true'
         uses: actions/cache/save@v4
         continue-on-error: true
         with:

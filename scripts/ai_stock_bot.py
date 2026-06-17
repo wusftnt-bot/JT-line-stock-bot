@@ -2736,6 +2736,10 @@ def assert_market_close_ready() -> None:
         )
 
 
+def is_pre_close_error(error: Exception) -> bool:
+    return "market close data not ready" in str(error).lower()
+
+
 def assert_data_completeness_ready() -> None:
     if env_bool("AI_STOCK_ALLOW_INCOMPLETE_DATA_PUSH", False):
         return
@@ -3547,6 +3551,8 @@ def main() -> None:
         message = build_line_message(top_stocks, opportunity_stocks, watchlist_stocks, radar_stocks, exit_alerts)
     except Exception as error:
         if not push_enabled:
+            raise
+        if is_pre_close_error(error):
             raise
         top_stocks = []
         opportunity_stocks = []

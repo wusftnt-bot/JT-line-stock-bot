@@ -3,8 +3,9 @@ name: line-stock-watchdog
 on:
   workflow_dispatch:
   schedule:
-    # 19:40 Asia/Taipei. GitHub Actions schedules use UTC.
-    - cron: "40 11 * * 1-5"
+    # 19:45/20:00 Asia/Taipei. GitHub Actions schedules use UTC.
+    - cron: "45 11 * * 1-5"
+    - cron: "0 12 * * 1-5"
 
 jobs:
   ensure-line-stock-run:
@@ -31,6 +32,13 @@ jobs:
           token = os.environ["GH_TOKEN"]
           repo = os.environ["REPO"]
           workflow_file = os.environ["WORKFLOW_FILE"]
+          taipei = timezone(timedelta(hours=8))
+          taipei_now = datetime.now(taipei)
+          hm = taipei_now.hour * 100 + taipei_now.minute
+          if hm < 1915 or hm > 2010:
+              print(f"LINE_STOCK_WATCHDOG outside Taipei push window; skip. taipei={taipei_now:%Y-%m-%d %H:%M}")
+              sys.exit(0)
+
           headers = {
               "Accept": "application/vnd.github+json",
               "Authorization": f"Bearer {token}",
