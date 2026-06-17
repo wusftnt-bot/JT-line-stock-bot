@@ -15,8 +15,9 @@ Telegram workflows and scripts intentionally stay in `JT-PM` and are not copied 
 
 ## Schedule
 
-- Main LINE stock workflow: Monday-Friday, 19:30 Asia/Taipei (`30 11 * * 1-5` UTC)
-- Watchdog: Monday-Friday, 19:40 Asia/Taipei (`40 11 * * 1-5` UTC)
+- Main LINE stock workflow: Monday-Friday, 19:20 / 19:35 / 19:50 Asia/Taipei (`20,35,50 11 * * 1-5` UTC)
+- Watchdog: Monday-Friday, 19:45 / 20:00 Asia/Taipei (`45 11 * * 1-5`, `0 12 * * 1-5` UTC)
+- Scheduled runs outside 19:15-20:10 Asia/Taipei are skipped to prevent stale overnight pushes.
 
 ## Required GitHub Actions secrets
 
@@ -25,6 +26,7 @@ Set these under `Settings -> Secrets and variables -> Actions`:
 - `AI_POWERED_STOCK` LINE channel access token
 - `LINE_TO` LINE recipient id for direct debug/production push
 - `FINMIND_TOKEN` optional but recommended for fallback data
+- `GEMINI_API_KEY` optional; enables candidate-only qualitative review. Never commit the key to this repo.
 
 ## Boundary Rules
 

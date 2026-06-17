@@ -35,6 +35,7 @@ TWSE_ATTENTION_URL = "https://openapi.twse.com.tw/v1/announcement/notice"
 TPEX_DISPOSAL_URL = "https://www.tpex.org.tw/openapi/v1/tpex_disposal_information"
 TPEX_ESB_DISPOSAL_URL = "https://www.tpex.org.tw/openapi/v1/tpex_esb_disposal_information"
 FINMIND_DATA_URL = "https://api.finmindtrade.com/api/v4/data"
+GEMINI_GENERATE_CONTENT_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 LINE_BROADCAST_URL = "https://api.line.me/v2/bot/message/broadcast"
 DAILY_FINANCE_REPORT_URL = os.getenv("DAILY_FINANCE_REPORT_URL", "https://wusftnt-bot.github.io/daily-finance-report/")
@@ -64,6 +65,7 @@ DATA_SOURCE_STATUS = {
     "market_score": "unknown",
     "industry_momentum": "unknown",
     "exit_alerts": "unknown",
+    "gemini_review": "disabled",
 }
 
 THEME_BY_STOCK_ID: dict[str, str] | None = None
@@ -3116,6 +3118,34 @@ def format_trade_date(value: Any) -> str:
     return str(value or "")
 
 
+def build_ai_review_lines(
+    top_stocks: list[StockRow],
+    opportunity_stocks: list[StockRow],
+    watchlist_stocks: list[StockRow],
+    radar_stocks: list[StockRow],
+) -> list[str]:
+    rows: list[StockRow] = []
+    seen: set[str] = set()
+    for source_rows in [top_stocks, opportunity_stocks, watchlist_stocks, radar_stocks]:
+        for row in source_rows:
+            stock_id = str(row.get("stock_id") or "")
+            if stock_id and stock_id not in seen and row.get("ai_review"):
+                rows.append(row)
+                seen.add(stock_id)
+            if len(rows) >= env_int("AI_STOCK_LINE_AI_REVIEW_DISPLAY_LIMIT", 3):
+                break
+        if len(rows) >= env_int("AI_STOCK_LINE_AI_REVIEW_DISPLAY_LIMIT", 3):
+            break
+    if not rows:
+        return []
+    lines = ["AI質化摘要：僅輔助候選股審查，不取代量化分數"]
+    for row in rows:
+        review_line = format_ai_review(row)
+        if review_line:
+            lines.append(f"{row.get('stock_id')} {row.get('stock_name')}｜{review_line}")
+    return lines
+
+
 def build_line_message(
     top_stocks: list[StockRow],
     opportunity_stocks: list[StockRow],
@@ -3137,6 +3167,10 @@ def build_line_message(
     ]
     lines.extend(_readable_top_summary(rows_for_grade))
     lines.append("====================")
+    ai_review_lines = build_ai_review_lines(top_stocks, opportunity_stocks, watchlist_stocks, radar_stocks)
+    if ai_review_lines:
+        lines.extend(ai_review_lines)
+        lines.append("====================")
     top_display = top_stocks[: env_int("AI_STOCK_LINE_TOP_DISPLAY_LIMIT", 5)]
     opportunity_display = opportunity_stocks[: env_int("AI_STOCK_LINE_OPPORTUNITY_DISPLAY_LIMIT", 3)]
     watchlist_display = watchlist_stocks[: env_int("AI_STOCK_LINE_WATCH_DISPLAY_LIMIT", 3)]
@@ -3258,6 +3292,200 @@ def push_line_message(message: str) -> None:
         details = error.read().decode("utf-8", errors="replace")
         mode = "broadcast" if use_broadcast else "push"
         raise RuntimeError(f"LINE Bot {mode} failed: HTTP {error.code} {details}") from error
+
+
+def compact_for_gemini(row: StockRow, bucket: str) -> dict[str, Any]:
+    return {
+        "bucket": bucket,
+        "stock_id": row.get("stock_id"),
+        "stock_name": row.get("stock_name"),
+        "grade": row.get("model_grade"),
+        "total_score": row.get("total_score"),
+        "fundamental_score": row.get("fundamental_score"),
+        "technical_score": row.get("technical_score"),
+        "chip_score": row.get("chip_score"),
+        "valuation_score": row.get("valuation_score"),
+        "industry_score": row.get("industry_score"),
+        "eps_acceleration_score": row.get("eps_acceleration_score"),
+        "industry": row.get("industry_category"),
+        "theme": row.get("industry_theme"),
+        "monthly_revenue_yoy": row.get("yoy"),
+        "monthly_revenue_mom": row.get("mom"),
+        "accumulated_revenue_yoy": row.get("acc_yoy"),
+        "eps": row.get("eps"),
+        "roe": row.get("roe"),
+        "gross_margin": row.get("gross_margin"),
+        "operating_margin": row.get("operating_margin"),
+        "net_margin": row.get("net_margin"),
+        "pe_ratio": row.get("pe_ratio"),
+        "pbr": row.get("pbr"),
+        "price_change_1d": row.get("price_change_1d"),
+        "price_change_20d": row.get("price_change_20d"),
+        "volume_ratio": row.get("volume_ratio"),
+        "foreign_5d_lots": shares_to_lots(row.get("foreign_5d_sum", 0)),
+        "trust_5d_lots": shares_to_lots(row.get("trust_5d_sum", 0)),
+        "foreign_10d_lots": shares_to_lots(row.get("foreign_10d_sum", 0)),
+        "trust_10d_lots": shares_to_lots(row.get("trust_10d_sum", 0)),
+        "latest_foreign_lots": shares_to_lots(row.get("latest_foreign_net", 0)),
+        "latest_trust_lots": shares_to_lots(row.get("latest_trust_net", 0)),
+        "risk_notes": row.get("risk_notes"),
+        "event_risk_reason": row.get("event_risk_reason"),
+        "top_quality_reason": row.get("top_quality_reason"),
+        "opportunity_reason": row.get("opportunity_reason"),
+    }
+
+
+def gemini_prompt(candidates: list[dict[str, Any]]) -> str:
+    payload = {
+        "instructions": [
+            "你是台股候選股質化審查員，只能根據提供的資料判斷，不可編造新聞、法說會或未提供的財報文字。",
+            "請輔助既有量化模型，不要給買賣指令，不要用保證語氣。",
+            "重點檢查：財務品質、月營收可持續性、法人籌碼是否一致、短線題材或過熱風險、是否需要等待量縮或回測。",
+            "若缺少新聞、法說會或財報文字來源，請在風險中用簡短文字指出。",
+            "只回 JSON array，每個元素包含 stock_id, catalyst, risk, sustainability, theme_quality, confidence, summary。",
+            "confidence 使用 0-10 整數；summary 限 45 個中文字內。",
+        ],
+        "candidates": candidates,
+    }
+    return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def parse_json_array_from_text(text: str) -> list[dict[str, Any]]:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        match = re.search(r"\[[\s\S]*\]", cleaned)
+        if not match:
+            raise
+        parsed = json.loads(match.group(0))
+    if not isinstance(parsed, list):
+        raise ValueError("Gemini response is not a JSON array.")
+    return [item for item in parsed if isinstance(item, dict)]
+
+
+def request_gemini_reviews(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        DATA_SOURCE_STATUS["gemini_review"] = "disabled missing_key"
+        return []
+    model = env_str("GEMINI_MODEL", "gemini-3.5-flash")
+    endpoint = GEMINI_GENERATE_CONTENT_URL.format(model=model)
+    url = f"{endpoint}?{urlencode({'key': api_key})}"
+    body = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": gemini_prompt(candidates)}],
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.2,
+            "responseMimeType": "application/json",
+        },
+    }
+    request = Request(
+        url,
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    timeout = env_int("GEMINI_TIMEOUT_SEC", 30)
+    with urlopen(request, timeout=timeout) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    text = (
+        payload.get("candidates", [{}])[0]
+        .get("content", {})
+        .get("parts", [{}])[0]
+        .get("text", "")
+    )
+    reviews = parse_json_array_from_text(text)
+    DATA_SOURCE_STATUS["gemini_review"] = f"enabled reviewed={len(reviews)} model={model}"
+    return reviews
+
+
+def attach_gemini_reviews(
+    top_stocks: list[StockRow],
+    opportunity_stocks: list[StockRow],
+    watchlist_stocks: list[StockRow],
+    radar_stocks: list[StockRow],
+) -> None:
+    limit = env_int("AI_STOCK_GEMINI_REVIEW_LIMIT", 6)
+    if limit <= 0:
+        DATA_SOURCE_STATUS["gemini_review"] = "disabled limit=0"
+        return
+
+    ordered: list[tuple[str, StockRow]] = []
+    for bucket, rows in [
+        ("top", top_stocks),
+        ("opportunity", opportunity_stocks),
+        ("watchlist", watchlist_stocks),
+        ("radar", radar_stocks),
+    ]:
+        for row in rows:
+            stock_id = str(row.get("stock_id") or "")
+            if stock_id and all(str(existing.get("stock_id") or "") != stock_id for _, existing in ordered):
+                ordered.append((bucket, row))
+            if len(ordered) >= limit:
+                break
+        if len(ordered) >= limit:
+            break
+
+    if not ordered:
+        DATA_SOURCE_STATUS["gemini_review"] = "empty"
+        return
+
+    candidates = [compact_for_gemini(row, bucket) for bucket, row in ordered]
+    try:
+        reviews = request_gemini_reviews(candidates)
+    except Exception as error:
+        DATA_SOURCE_STATUS["gemini_review"] = f"failed {type(error).__name__}"
+        print(f"GEMINI_REVIEW_FAILED {type(error).__name__}: {error}")
+        return
+
+    if not reviews:
+        if DATA_SOURCE_STATUS.get("gemini_review") == "disabled missing_key":
+            return
+        DATA_SOURCE_STATUS["gemini_review"] = "enabled reviewed=0"
+        return
+
+    by_stock = {str(item.get("stock_id") or ""): item for item in reviews}
+    attached = 0
+    for _, row in ordered:
+        review = by_stock.get(str(row.get("stock_id") or ""))
+        if not review:
+            continue
+        summary = str(review.get("summary") or "").strip()
+        risk = str(review.get("risk") or "").strip()
+        confidence = review.get("confidence")
+        row["ai_review"] = {
+            "summary": summary[:90],
+            "risk": risk[:80],
+            "confidence": confidence,
+            "catalyst": str(review.get("catalyst") or "").strip()[:80],
+            "sustainability": str(review.get("sustainability") or "").strip()[:80],
+            "theme_quality": str(review.get("theme_quality") or "").strip()[:80],
+        }
+        attached += 1
+    DATA_SOURCE_STATUS["gemini_review"] = f"enabled reviewed={len(reviews)} attached={attached}"
+
+
+def format_ai_review(row: StockRow) -> str | None:
+    review = row.get("ai_review")
+    if not isinstance(review, dict):
+        return None
+    summary = str(review.get("summary") or "").strip()
+    if not summary:
+        return None
+    confidence = review.get("confidence")
+    try:
+        confidence_text = f"{float(confidence):.0f}/10"
+    except (TypeError, ValueError):
+        confidence_text = "?/10"
+    return f"AI摘要：{summary}｜信心 {confidence_text}"
 
 
 def write_csv(path: Path, rows: list[StockRow]) -> None:
@@ -3548,6 +3776,7 @@ def main() -> None:
         if push_enabled:
             assert_data_completeness_ready()
         write_strategy_tracker(top_stocks, opportunity_stocks, watchlist_stocks, radar_stocks, exit_alerts)
+        attach_gemini_reviews(top_stocks, opportunity_stocks, watchlist_stocks, radar_stocks)
         message = build_line_message(top_stocks, opportunity_stocks, watchlist_stocks, radar_stocks, exit_alerts)
     except Exception as error:
         if not push_enabled:
