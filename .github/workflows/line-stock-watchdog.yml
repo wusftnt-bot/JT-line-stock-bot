@@ -57,6 +57,7 @@ jobs:
           now = datetime.now(timezone.utc)
           window_start = datetime.combine(now.date(), time(11, 15), tzinfo=timezone.utc)
           runs = request("GET", f"/actions/workflows/{workflow_file}/runs?per_page=20").get("workflow_runs", [])
+          stale_minutes = int(os.getenv("STALE_RUN_MINUTES", "35"))
 
           matching = []
           for run in runs:
@@ -64,11 +65,20 @@ jobs:
               if created >= window_start and run.get("event") in {"schedule", "workflow_dispatch"}:
                   matching.append(run)
 
+          stale_running = []
           healthy = [
               run for run in matching
-              if run.get("status") in {"queued", "in_progress"}
-              or (run.get("status") == "completed" and run.get("conclusion") == "success")
+              if run.get("status") == "completed" and run.get("conclusion") == "success"
           ]
+          for run in matching:
+              if run.get("status") not in {"queued", "in_progress"}:
+                  continue
+              created = datetime.fromisoformat(run["created_at"].replace("Z", "+00:00"))
+              age_minutes = (now - created).total_seconds() / 60
+              if age_minutes <= stale_minutes:
+                  healthy.append(run)
+              else:
+                  stale_running.append(run)
           if healthy:
               best = healthy[0]
               print(
@@ -77,6 +87,13 @@ jobs:
                   f"conclusion={best.get('conclusion')} created_at={best.get('created_at')}"
               )
               sys.exit(0)
+
+          for run in stale_running:
+              try:
+                  request("POST", f"/actions/runs/{run.get('id')}/cancel", b"")
+                  print(f"LINE_STOCK_WATCHDOG canceled stale run_id={run.get('id')} status={run.get('status')}")
+              except Exception as error:
+                  print(f"LINE_STOCK_WATCHDOG cancel_failed run_id={run.get('id')} error={type(error).__name__}:{error}")
 
           payload = json.dumps({
               "ref": "main",

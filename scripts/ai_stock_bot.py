@@ -8,6 +8,7 @@ import json
 import math
 import os
 import re
+import signal
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -69,6 +70,22 @@ DATA_SOURCE_STATUS = {
 }
 
 THEME_BY_STOCK_ID: dict[str, str] | None = None
+
+
+class RunDeadlineExceeded(TimeoutError):
+    pass
+
+
+def install_run_deadline() -> None:
+    seconds = env_int("AI_STOCK_MAX_RUNTIME_SEC", 0)
+    if seconds <= 0 or not hasattr(signal, "SIGALRM"):
+        return
+
+    def _raise_deadline(_signum: int, _frame: Any) -> None:
+        raise RunDeadlineExceeded(f"AI stock bot exceeded runtime deadline {seconds}s")
+
+    signal.signal(signal.SIGALRM, _raise_deadline)
+    signal.alarm(seconds)
 
 RENAME_MAP = {
     "公司代號": "stock_id",
@@ -3785,6 +3802,7 @@ def main() -> None:
     started_at = datetime.now(TAIPEI_TZ)
     started_perf = time.perf_counter()
     push_enabled = args.push_line or env_bool("ENABLE_LINE_PUSH")
+    install_run_deadline()
     try:
         if push_enabled:
             assert_market_close_ready()

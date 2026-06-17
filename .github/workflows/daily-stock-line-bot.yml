@@ -32,6 +32,7 @@ concurrency:
 jobs:
   stock-selection-line-push:
     runs-on: ubuntu-latest
+    timeout-minutes: 35
     permissions:
       contents: read
     env:
@@ -106,6 +107,7 @@ jobs:
       AI_STOCK_CASH_FLOW_NEUTRAL_SCORE: "3"
       AI_STOCK_FINMIND_FUNDAMENTAL_LIMIT: "10"
       AI_STOCK_TRACKER_MAX_PER_RUN: "30"
+      AI_STOCK_MAX_RUNTIME_SEC: "1800"
       AI_STOCK_MARGIN_RISK_RATIO: "0.20"
       LINE_BROADCAST: "false"
       DAILY_FINANCE_REPORT_URL: "https://wusftnt-bot.github.io/daily-finance-report/"
@@ -183,6 +185,7 @@ jobs:
           python-version: "3.11"
 
       - name: Run AI stock bot and push LINE message
+        timeout-minutes: 32
         if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true'
         shell: bash
         env:
