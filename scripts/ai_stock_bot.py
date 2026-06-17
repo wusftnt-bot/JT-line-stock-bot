@@ -3387,7 +3387,7 @@ def request_gemini_reviews(candidates: list[dict[str, Any]]) -> list[dict[str, A
     timeout = env_int("GEMINI_TIMEOUT_SEC", 30)
     models = [
         model.strip()
-        for model in env_str("GEMINI_MODEL_SEQUENCE", env_str("GEMINI_MODEL", "gemini-2.5-flash,gemini-3.5-flash")).split(",")
+        for model in env_str("GEMINI_MODEL_SEQUENCE", env_str("GEMINI_MODEL", "gemini-2.5-flash-lite,gemini-2.5-flash")).split(",")
         if model.strip()
     ]
     last_error: Exception | None = None

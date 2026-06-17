@@ -84,7 +84,7 @@ jobs:
       AI_STOCK_LINE_RADAR_DISPLAY_LIMIT: "3"
       AI_STOCK_LINE_EXIT_DISPLAY_LIMIT: "3"
       AI_STOCK_LINE_AI_REVIEW_DISPLAY_LIMIT: "3"
-      AI_STOCK_GEMINI_REVIEW_LIMIT: "6"
+      AI_STOCK_GEMINI_REVIEW_LIMIT: "3"
       AI_STOCK_ALLOW_INCOMPLETE_DATA_PUSH: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_latest_available_data == 'true' && 'true' || 'false' }}
       AI_STOCK_MIN_AVG_VOLUME_LOTS: "500"
       AI_STOCK_VALUATION_NEUTRAL_SCORE: "6"
@@ -98,8 +98,9 @@ jobs:
       DAILY_FINANCE_REPORT_URL: "https://wusftnt-bot.github.io/daily-finance-report/"
       FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      GEMINI_MODEL_SEQUENCE: "gemini-2.5-flash,gemini-3.5-flash"
-      GEMINI_RETRY: "2"
+      GEMINI_MODEL_SEQUENCE: "gemini-2.5-flash-lite,gemini-2.5-flash"
+      GEMINI_RETRY: "1"
+      GEMINI_TIMEOUT_SEC: "20"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
