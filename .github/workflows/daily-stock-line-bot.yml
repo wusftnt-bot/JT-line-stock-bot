@@ -11,10 +11,23 @@ on:
         options:
           - "false"
           - "true"
+      mark_sent:
+        description: "Internal watchdog use only: save the daily sent marker after a successful push."
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
   schedule:
-    # 19:20/19:35/19:50 Asia/Taipei. GitHub Actions schedules use UTC.
-    # Multiple slots reduce schedule-delay risk; sent marker prevents duplicate pushes.
-    - cron: "20,35,50 11 * * 1-5"
+    # 19:15-20:30 Asia/Taipei every 5 minutes. GitHub Actions schedules use UTC.
+    # Frequent slots reduce best-effort schedule misses; sent marker and concurrency prevent duplicates.
+    - cron: "15,20,25,30,35,40,45,50,55 11 * * 1-5"
+    - cron: "0,5,10,15,20,25,30 12 * * 1-5"
+
+concurrency:
+  group: line-stock-bot-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   stock-selection-line-push:
@@ -116,13 +129,18 @@ jobs:
           echo "sent_marker=.sent/line/line-stock-$today.txt" >> "$GITHUB_OUTPUT"
           echo "sent_cache_key=line-stock-$today" >> "$GITHUB_OUTPUT"
           echo "data_cache_prefix=ai-stock-data-cache-" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ inputs.mark_sent || 'false' }}" = "true" ]; then
+            echo "should_mark_sent=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_mark_sent=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Guard scheduled push window
         id: push-window
         shell: bash
         run: |
           hm="${{ steps.taipei.outputs.hm }}"
-          if [ "${{ github.event_name }}" = "schedule" ] && { [ "$hm" -lt 1915 ] || [ "$hm" -gt 2010 ]; }; then
+          if [ "${{ github.event_name }}" = "schedule" ] && { [ "$hm" -lt 1915 ] || [ "$hm" -gt 2030 ]; }; then
             echo "allowed=false" >> "$GITHUB_OUTPUT"
             echo "LINE stock bot schedule fired outside Taipei push window; skip push. taipei_hm=$hm"
           else
@@ -142,7 +160,7 @@ jobs:
         if: steps.push-window.outputs.allowed == 'true'
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "schedule" ] && [ "${{ steps.sent-cache.outputs.cache-hit }}" = "true" ]; then
+          if [ "${{ steps.taipei.outputs.should_mark_sent }}" = "true" ] && [ "${{ steps.sent-cache.outputs.cache-hit }}" = "true" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "LINE stock bot already sent today via cache marker."
           else
@@ -184,7 +202,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Create sent marker
-        if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true'
+        if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true' && steps.taipei.outputs.should_mark_sent == 'true'
         shell: bash
         run: |
           mkdir -p "$(dirname "${{ steps.taipei.outputs.sent_marker }}")"
@@ -197,7 +215,7 @@ jobs:
           } > "${{ steps.taipei.outputs.sent_marker }}"
 
       - name: Save sent marker
-        if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true'
+        if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true' && steps.taipei.outputs.should_mark_sent == 'true'
         uses: actions/cache/save@v4
         continue-on-error: true
         with:

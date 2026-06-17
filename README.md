@@ -15,9 +15,10 @@ Telegram workflows and scripts intentionally stay in `JT-PM` and are not copied 
 
 ## Schedule
 
-- Main LINE stock workflow: Monday-Friday, 19:20 / 19:35 / 19:50 Asia/Taipei (`20,35,50 11 * * 1-5` UTC)
-- Watchdog: Monday-Friday, 19:45 / 20:00 Asia/Taipei (`45 11 * * 1-5`, `0 12 * * 1-5` UTC)
-- Scheduled runs outside 19:15-20:10 Asia/Taipei are skipped to prevent stale overnight pushes.
+- Main LINE stock workflow: Monday-Friday, every 5 minutes from 19:15-20:30 Asia/Taipei.
+- Watchdog: Monday-Friday, backup checks from 19:45-20:30 Asia/Taipei.
+- Scheduled runs outside 19:15-20:30 Asia/Taipei are skipped to prevent stale overnight pushes.
+- Manual test runs do not save the daily sent marker; only scheduled/backup runs mark the day as sent.
 
 ## Required GitHub Actions secrets
 

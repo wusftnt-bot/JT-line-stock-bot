@@ -3,9 +3,9 @@ name: line-stock-watchdog
 on:
   workflow_dispatch:
   schedule:
-    # 19:45/20:00 Asia/Taipei. GitHub Actions schedules use UTC.
-    - cron: "45 11 * * 1-5"
-    - cron: "0 12 * * 1-5"
+    # 19:45-20:30 Asia/Taipei backup checks. GitHub Actions schedules use UTC.
+    - cron: "45,55 11 * * 1-5"
+    - cron: "0,10,20,30 12 * * 1-5"
 
 jobs:
   ensure-line-stock-run:
@@ -27,7 +27,7 @@ jobs:
           import os
           import sys
           import urllib.request
-          from datetime import datetime, time, timezone
+          from datetime import datetime, time, timedelta, timezone
 
           token = os.environ["GH_TOKEN"]
           repo = os.environ["REPO"]
@@ -35,7 +35,7 @@ jobs:
           taipei = timezone(timedelta(hours=8))
           taipei_now = datetime.now(taipei)
           hm = taipei_now.hour * 100 + taipei_now.minute
-          if hm < 1915 or hm > 2010:
+          if hm < 1915 or hm > 2030:
               print(f"LINE_STOCK_WATCHDOG outside Taipei push window; skip. taipei={taipei_now:%Y-%m-%d %H:%M}")
               sys.exit(0)
 
@@ -55,7 +55,7 @@ jobs:
                   return json.loads(body) if body else {}
 
           now = datetime.now(timezone.utc)
-          window_start = datetime.combine(now.date(), time(11, 25), tzinfo=timezone.utc)
+          window_start = datetime.combine(now.date(), time(11, 15), tzinfo=timezone.utc)
           runs = request("GET", f"/actions/workflows/{workflow_file}/runs?per_page=20").get("workflow_runs", [])
 
           matching = []
@@ -78,7 +78,13 @@ jobs:
               )
               sys.exit(0)
 
-          payload = json.dumps({"ref": "main"}).encode("utf-8")
+          payload = json.dumps({
+              "ref": "main",
+              "inputs": {
+                  "allow_latest_available_data": "false",
+                  "mark_sent": "true",
+              },
+          }).encode("utf-8")
           request("POST", f"/actions/workflows/{workflow_file}/dispatches", payload)
           failed = [
               f"{run.get('id')}:{run.get('status')}:{run.get('conclusion')}"
