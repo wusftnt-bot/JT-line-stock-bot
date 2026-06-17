@@ -3372,9 +3372,6 @@ def request_gemini_reviews(candidates: list[dict[str, Any]]) -> list[dict[str, A
     if not api_key:
         DATA_SOURCE_STATUS["gemini_review"] = "disabled missing_key"
         return []
-    model = env_str("GEMINI_MODEL", "gemini-3.5-flash")
-    endpoint = GEMINI_GENERATE_CONTENT_URL.format(model=model)
-    url = f"{endpoint}?{urlencode({'key': api_key})}"
     body = {
         "contents": [
             {
@@ -3387,24 +3384,43 @@ def request_gemini_reviews(candidates: list[dict[str, Any]]) -> list[dict[str, A
             "responseMimeType": "application/json",
         },
     }
-    request = Request(
-        url,
-        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
     timeout = env_int("GEMINI_TIMEOUT_SEC", 30)
-    with urlopen(request, timeout=timeout) as response:
-        payload = json.loads(response.read().decode("utf-8"))
-    text = (
-        payload.get("candidates", [{}])[0]
-        .get("content", {})
-        .get("parts", [{}])[0]
-        .get("text", "")
-    )
-    reviews = parse_json_array_from_text(text)
-    DATA_SOURCE_STATUS["gemini_review"] = f"enabled reviewed={len(reviews)} model={model}"
-    return reviews
+    models = [
+        model.strip()
+        for model in env_str("GEMINI_MODEL_SEQUENCE", env_str("GEMINI_MODEL", "gemini-2.5-flash,gemini-3.5-flash")).split(",")
+        if model.strip()
+    ]
+    last_error: Exception | None = None
+    for model in models:
+        endpoint = GEMINI_GENERATE_CONTENT_URL.format(model=model)
+        url = f"{endpoint}?{urlencode({'key': api_key})}"
+        request = Request(
+            url,
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        for attempt in range(1, env_int("GEMINI_RETRY", 2) + 1):
+            try:
+                with urlopen(request, timeout=timeout) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                text = (
+                    payload.get("candidates", [{}])[0]
+                    .get("content", {})
+                    .get("parts", [{}])[0]
+                    .get("text", "")
+                )
+                reviews = parse_json_array_from_text(text)
+                DATA_SOURCE_STATUS["gemini_review"] = f"enabled reviewed={len(reviews)} model={model}"
+                return reviews
+            except HTTPError as error:
+                last_error = RuntimeError(f"model={model} attempt={attempt} http={error.code}")
+                if error.code not in {429, 500, 502, 503, 504}:
+                    raise last_error from error
+            except Exception as error:
+                last_error = error
+            time.sleep(2 * attempt)
+    raise RuntimeError(f"Gemini review failed after fallbacks: {last_error}")
 
 
 def attach_gemini_reviews(

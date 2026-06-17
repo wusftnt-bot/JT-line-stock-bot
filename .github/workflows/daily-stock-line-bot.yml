@@ -98,7 +98,8 @@ jobs:
       DAILY_FINANCE_REPORT_URL: "https://wusftnt-bot.github.io/daily-finance-report/"
       FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      GEMINI_MODEL: "gemini-3.5-flash"
+      GEMINI_MODEL_SEQUENCE: "gemini-2.5-flash,gemini-3.5-flash"
+      GEMINI_RETRY: "2"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
