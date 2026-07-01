@@ -498,6 +498,21 @@ def fetch_finmind_institutional_records(stock_id: str, days: int = 45) -> list[d
     return sorted(grouped.values(), key=lambda item: item["date"], reverse=True)
 
 
+def fetch_finmind_trading_daily_report(stock_id: str, trade_date: str) -> list[dict[str, Any]]:
+    if not os.getenv("FINMIND_TOKEN", "").strip():
+        raise RuntimeError("Missing FINMIND_TOKEN for TaiwanStockTradingDailyReport.")
+    date_text = format_trade_date(trade_date)
+    if "/" in date_text:
+        parts = date_text.split("/")
+        date_text = f"{int(parts[0]):04d}-{int(parts[1]):02d}-{int(parts[2]):02d}"
+    rows = request_finmind(
+        "TaiwanStockTradingDailyReport",
+        {"data_id": stock_id, "start_date": date_text, "end_date": date_text},
+        timeout=45,
+    )
+    return [row for row in rows if str(row.get("stock_id") or stock_id).strip() == stock_id]
+
+
 def fetch_finmind_margin_record(stock_id: str, days: int = 14) -> dict[str, float]:
     start_date = (datetime.now(TAIPEI_TZ).date() - timedelta(days=days)).strftime("%Y-%m-%d")
     rows = request_finmind("TaiwanStockMarginPurchaseShortSale", {"data_id": stock_id, "start_date": start_date}, timeout=45)
@@ -3521,6 +3536,136 @@ def format_ai_review(row: StockRow) -> str | None:
     return f"AI摘要：{summary}｜信心 {confidence_text}"
 
 
+def trading_report_number(row: dict[str, Any], aliases: list[str]) -> float:
+    for alias in aliases:
+        if alias in row:
+            return clean_number(row.get(alias))
+    return 0.0
+
+
+def summarize_trading_daily_report(entry: dict[str, Any]) -> dict[str, Any]:
+    stock_id = str(entry.get("stock_id") or "")
+    stock_name = str(entry.get("stock_name") or "")
+    trade_date = str(entry.get("latest_trade_date") or entry.get("date") or datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d"))
+    rows = fetch_finmind_trading_daily_report(stock_id, trade_date)
+    records: list[dict[str, Any]] = []
+    for row in rows:
+        broker_id = str(row.get("securities_trader_id") or row.get("SecuritiesBrokerId") or "").strip()
+        broker_name = str(row.get("securities_trader") or row.get("SecuritiesBrokerName") or broker_id or "unknown").strip()
+        buy = trading_report_number(row, ["buy", "BuyNum", "Buy", "buy_num"])
+        sell = trading_report_number(row, ["sell", "SellNum", "Sell", "sell_num"])
+        net = buy - sell
+        if buy == 0 and sell == 0:
+            continue
+        records.append({"broker": broker_name[:16], "broker_id": broker_id, "buy": buy, "sell": sell, "net": net})
+
+    if not records:
+        return {"stock_id": stock_id, "stock_name": stock_name, "source": entry.get("source"), "status": "no_data"}
+
+    total_buy = sum(max(float(item["buy"]), 0.0) for item in records)
+    total_sell = sum(max(float(item["sell"]), 0.0) for item in records)
+    top_buy = [item for item in sorted(records, key=lambda item: item["net"], reverse=True)[:5] if item["net"] > 0]
+    top_sell = [item for item in sorted(records, key=lambda item: item["net"])[:5] if item["net"] < 0]
+    top_buy_net = sum(float(item["net"]) for item in top_buy)
+    top_sell_net = abs(sum(float(item["net"]) for item in top_sell))
+    concentration = top_buy_net / total_buy if total_buy > 0 else 0.0
+    sell_concentration = top_sell_net / total_sell if total_sell > 0 else 0.0
+    buy_text = "、".join(f"{item['broker']} {shares_to_lots(float(item['net'])):,.0f}張" for item in top_buy[:3]) or "無明顯集中買方"
+    risk_flags = []
+    if concentration >= 0.18:
+        risk_flags.append("買方集中")
+    elif concentration >= 0.10:
+        risk_flags.append("買方略集中")
+    else:
+        risk_flags.append("買方分散")
+    if sell_concentration >= 0.18 and top_sell_net >= top_buy_net * 0.8:
+        risk_flags.append("賣壓集中")
+    if total_buy > 0 and total_sell > 0 and top_buy_net < top_sell_net:
+        risk_flags.append("主賣壓較強")
+
+    score = 50.0 + clip(concentration * 100, 0, 25) - clip(sell_concentration * 60 if top_sell_net >= top_buy_net * 0.8 else 0, 0, 20)
+    return {
+        "stock_id": stock_id,
+        "stock_name": stock_name,
+        "source": entry.get("source"),
+        "rank": entry.get("rank"),
+        "trade_date": format_trade_date(trade_date),
+        "status": "ok",
+        "branch_score": round(clip(score, 0, 100), 1),
+        "concentration": concentration,
+        "sell_concentration": sell_concentration,
+        "top_buy_lots": shares_to_lots(top_buy_net),
+        "top_sell_lots": shares_to_lots(top_sell_net),
+        "buy_text": buy_text,
+        "risk_flags": "、".join(risk_flags),
+    }
+
+
+def today_strategy_entries() -> list[dict[str, Any]]:
+    tracker = read_cache("strategy_tracker")
+    history = tracker.get("history", []) if isinstance(tracker, dict) else []
+    today = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    for day_record in reversed(history):
+        if str(day_record.get("date") or "") == today:
+            entries = day_record.get("entries", [])
+            return [entry for entry in entries if isinstance(entry, dict)]
+    return []
+
+
+def build_branch_report_message() -> str:
+    entries = today_strategy_entries()
+    if not entries:
+        return (
+            "AI Stock Bot V2 分點二次篩選\n"
+            "====================\n"
+            "今日尚未找到 20:00 主推播候選名單，暫不進行分點二次篩選。"
+        )
+    if not os.getenv("FINMIND_TOKEN", "").strip():
+        return (
+            "AI Stock Bot V2 分點二次篩選\n"
+            "====================\n"
+            "尚未設定 FINMIND_TOKEN，無法查詢 TaiwanStockTradingDailyReport。"
+        )
+
+    limit = env_int("AI_STOCK_BRANCH_REPORT_LIMIT", 8)
+    summaries = []
+    errors: list[str] = []
+    for entry in entries[:limit]:
+        try:
+            summaries.append(summarize_trading_daily_report(entry))
+        except Exception as error:
+            errors.append(f"{entry.get('stock_id')}:{type(error).__name__}")
+            continue
+        time.sleep(0.25)
+
+    ok_items = [item for item in summaries if item.get("status") == "ok"]
+    ok_items.sort(key=lambda item: float(item.get("branch_score") or 0.0), reverse=True)
+    lines = [
+        "AI Stock Bot V2 分點二次篩選",
+        f"完整財經看板：{DAILY_FINANCE_REPORT_URL}",
+        "",
+        "說明：針對 20:00 主推播候選名單，使用 FinMind 每日買賣日報做第二層觀察；目前只顯示，不改主模型分數。",
+        "====================",
+    ]
+    if not ok_items:
+        reason = "；".join(errors[:3]) if errors else "FinMind 尚未提供今日分點資料或權限不足"
+        lines.extend(["今日分點資料尚未完成", f"原因：{reason}"])
+        return "\n".join(lines)
+
+    for index, item in enumerate(ok_items[:limit], start=1):
+        lines.extend(
+            [
+                f"{index}. {item['stock_id']} {item['stock_name']}｜分點觀察 {item['branch_score']:.1f}",
+                f"交易日 {item['trade_date']}｜前5買超占買量 {item['concentration'] * 100:.1f}%｜前5賣超占賣量 {item['sell_concentration'] * 100:.1f}%",
+                f"主買：{item['buy_text']}",
+                f"判讀：{item['risk_flags']}｜此為籌碼觀察，不代表買賣建議",
+            ]
+        )
+    if errors:
+        lines.extend(["====================", f"未完成查詢：{'; '.join(errors[:5])}"])
+    return "\n".join(lines)
+
+
 def write_csv(path: Path, rows: list[StockRow]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8-sig") as file:
@@ -3797,12 +3942,23 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="AI V2 stock selection bot for TWSE stocks.")
     parser.add_argument("--push-line", action="store_true", help="Push the report through LINE Messaging API.")
     parser.add_argument("--write-report", action="store_true", help="Write the report under reports/.")
+    parser.add_argument("--branch-report", action="store_true", help="Push a FinMind broker daily-report follow-up for today's candidates.")
     args = parser.parse_args()
 
     started_at = datetime.now(TAIPEI_TZ)
     started_perf = time.perf_counter()
     push_enabled = args.push_line or env_bool("ENABLE_LINE_PUSH")
     install_run_deadline()
+    if args.branch_report:
+        message = build_branch_report_message()
+        print(message)
+        counts = {"top": 0, "opportunity": 0, "watchlist": 0, "radar": 0, "exit": 0}
+        print_run_metrics("branch_report_complete", started_at, started_perf, counts)
+        if push_enabled:
+            push_line_message(message)
+        print_run_metrics("finished", started_at, started_perf, counts)
+        return
+
     try:
         if push_enabled:
             assert_market_close_ready()
