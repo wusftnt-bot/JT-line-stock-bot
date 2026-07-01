@@ -754,7 +754,7 @@ def fetch_mops_csv_rows(url: str, market_type: str) -> list[StockRow]:
 
 def row_value_by_keywords(row: dict[str, Any], keywords: list[str]) -> Any:
     for key, value in row.items():
-        key_text = str(key)
+        key_text = normalize_field_name(key)
         if all(keyword in key_text for keyword in keywords):
             return value
     return None
