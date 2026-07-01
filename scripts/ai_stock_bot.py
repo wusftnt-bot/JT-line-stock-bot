@@ -505,12 +505,18 @@ def fetch_finmind_trading_daily_report(stock_id: str, trade_date: str) -> list[d
     if "/" in date_text:
         parts = date_text.split("/")
         date_text = f"{int(parts[0]):04d}-{int(parts[1]):02d}-{int(parts[2]):02d}"
+    cache_name = f"finmind_trading_daily_report_{date_text}_{stock_id}"
+    cached = read_cache(cache_name)
+    if isinstance(cached, list):
+        return cached
     rows = request_finmind(
         "TaiwanStockTradingDailyReport",
         {"data_id": stock_id, "start_date": date_text, "end_date": date_text},
         timeout=45,
     )
-    return [row for row in rows if str(row.get("stock_id") or stock_id).strip() == stock_id]
+    filtered = [row for row in rows if str(row.get("stock_id") or stock_id).strip() == stock_id]
+    write_cache(cache_name, filtered)
+    return filtered
 
 
 def fetch_finmind_margin_record(stock_id: str, days: int = 14) -> dict[str, float]:
@@ -3543,10 +3549,7 @@ def trading_report_number(row: dict[str, Any], aliases: list[str]) -> float:
     return 0.0
 
 
-def summarize_trading_daily_report(entry: dict[str, Any]) -> dict[str, Any]:
-    stock_id = str(entry.get("stock_id") or "")
-    stock_name = str(entry.get("stock_name") or "")
-    trade_date = str(entry.get("latest_trade_date") or entry.get("date") or datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d"))
+def trading_report_records(stock_id: str, trade_date: str) -> list[dict[str, Any]]:
     rows = fetch_finmind_trading_daily_report(stock_id, trade_date)
     records: list[dict[str, Any]] = []
     for row in rows:
@@ -3554,10 +3557,105 @@ def summarize_trading_daily_report(entry: dict[str, Any]) -> dict[str, Any]:
         broker_name = str(row.get("securities_trader") or row.get("SecuritiesBrokerName") or broker_id or "unknown").strip()
         buy = trading_report_number(row, ["buy", "BuyNum", "Buy", "buy_num"])
         sell = trading_report_number(row, ["sell", "SellNum", "Sell", "sell_num"])
+        buy_price = trading_report_number(row, ["buy_price", "BuyPrice", "BuyAvgPrice", "price"])
+        sell_price = trading_report_number(row, ["sell_price", "SellPrice", "SellAvgPrice", "price"])
         net = buy - sell
         if buy == 0 and sell == 0:
             continue
-        records.append({"broker": broker_name[:16], "broker_id": broker_id, "buy": buy, "sell": sell, "net": net})
+        records.append(
+            {
+                "broker": broker_name[:16],
+                "broker_id": broker_id,
+                "key": broker_id or broker_name,
+                "buy": buy,
+                "sell": sell,
+                "net": net,
+                "buy_price": buy_price,
+                "sell_price": sell_price,
+            }
+        )
+    return records
+
+
+def weighted_average_price(records: list[dict[str, Any]], qty_key: str, price_key: str) -> float:
+    total_qty = sum(max(float(item.get(qty_key) or 0.0), 0.0) for item in records if float(item.get(price_key) or 0.0) > 0)
+    if total_qty <= 0:
+        return 0.0
+    weighted = sum(
+        max(float(item.get(qty_key) or 0.0), 0.0) * float(item.get(price_key) or 0.0)
+        for item in records
+        if float(item.get(price_key) or 0.0) > 0
+    )
+    return round(weighted / total_qty, 2)
+
+
+def branch_lookback_dates(trade_date: str, days: int) -> list[str]:
+    base_text = format_trade_date(trade_date)
+    try:
+        base_date = datetime.strptime(base_text, "%Y-%m-%d").date()
+    except ValueError:
+        base_date = datetime.now(TAIPEI_TZ).date()
+    dates: list[str] = []
+    offset = 1
+    while len(dates) < days and offset <= days * 3:
+        day = base_date - timedelta(days=offset)
+        if day.weekday() < 5:
+            dates.append(day.strftime("%Y-%m-%d"))
+        offset += 1
+    return dates
+
+
+def broker_key(record: dict[str, Any]) -> str:
+    return str(record.get("key") or record.get("broker_id") or record.get("broker") or "")
+
+
+def broker_habit_notes(stock_id: str, trade_date: str, top_buy: list[dict[str, Any]], concentration: float) -> tuple[str, str, str]:
+    if not top_buy:
+        return "無明顯主力分點", "分點勝率：待累積", "無"
+    daytrade_keywords = ["凱基台北", "台北", "美商高盛", "高盛", "摩根", "美林", "港商野村", "瑞銀"]
+    local_keywords = ["新竹", "竹科", "台南", "南科", "高雄", "台中", "桃園", "內湖", "汐止"]
+    top_keys = {broker_key(item) for item in top_buy[:3] if broker_key(item)}
+    history: dict[str, dict[str, float]] = {key: {"positive_days": 0, "sell_days": 0, "net_sum": 0.0} for key in top_keys}
+    for date_text in branch_lookback_dates(trade_date, env_int("AI_STOCK_BRANCH_LOOKBACK_DAYS", 5)):
+        try:
+            records = trading_report_records(stock_id, date_text)
+        except Exception:
+            continue
+        by_key = {broker_key(item): item for item in records if broker_key(item) in top_keys}
+        for key, item in by_key.items():
+            net = float(item.get("net") or 0.0)
+            if net > 0:
+                history[key]["positive_days"] += 1
+                history[key]["net_sum"] += net
+            if float(item.get("sell") or 0.0) > 0:
+                history[key]["sell_days"] += 1
+
+    top_names = " ".join(str(item.get("broker") or "") for item in top_buy[:3])
+    notes: list[str] = []
+    if any(keyword in top_names for keyword in daytrade_keywords) and concentration >= 0.10:
+        notes.append("隔日沖分點疑慮")
+    wave_names = []
+    for item in top_buy[:3]:
+        key = broker_key(item)
+        stats = history.get(key, {})
+        if stats.get("positive_days", 0) >= 3 and stats.get("sell_days", 0) <= 1:
+            wave_names.append(str(item.get("broker") or ""))
+    if wave_names:
+        notes.append(f"波段布局跡象：{ '、'.join(wave_names[:2]) }")
+    if not notes:
+        notes.append("主力習性：待觀察")
+
+    local_names = [str(item.get("broker") or "") for item in top_buy[:5] if any(keyword in str(item.get("broker") or "") for keyword in local_keywords)]
+    local_note = f"在地分點異動：{ '、'.join(local_names[:2]) }" if local_names else "在地分點：無明顯異動"
+    win_note = "分點勝率：追蹤中，需累積後續報酬"
+    return "；".join(notes), win_note, local_note
+
+
+def summarize_trading_daily_report(entry: dict[str, Any]) -> dict[str, Any]:
+    stock_id = str(entry.get("stock_id") or "")
+    stock_name = str(entry.get("stock_name") or "")
+    trade_date = str(entry.get("latest_trade_date") or entry.get("date") or datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d"))
+    records = trading_report_records(stock_id, trade_date)
 
     if not records:
         return {"stock_id": stock_id, "stock_name": stock_name, "source": entry.get("source"), "status": "no_data"}
@@ -3571,6 +3669,9 @@ def summarize_trading_daily_report(entry: dict[str, Any]) -> dict[str, Any]:
     concentration = top_buy_net / total_buy if total_buy > 0 else 0.0
     sell_concentration = top_sell_net / total_sell if total_sell > 0 else 0.0
     buy_text = "、".join(f"{item['broker']} {shares_to_lots(float(item['net'])):,.0f}張" for item in top_buy[:3]) or "無明顯集中買方"
+    top_buy_avg_price = weighted_average_price(top_buy, "buy", "buy_price")
+    top_sell_avg_price = weighted_average_price(top_sell, "sell", "sell_price")
+    habit_note, win_note, local_note = broker_habit_notes(stock_id, trade_date, top_buy, concentration)
     risk_flags = []
     if concentration >= 0.18:
         risk_flags.append("買方集中")
@@ -3596,8 +3697,13 @@ def summarize_trading_daily_report(entry: dict[str, Any]) -> dict[str, Any]:
         "sell_concentration": sell_concentration,
         "top_buy_lots": shares_to_lots(top_buy_net),
         "top_sell_lots": shares_to_lots(top_sell_net),
+        "top_buy_avg_price": top_buy_avg_price,
+        "top_sell_avg_price": top_sell_avg_price,
         "buy_text": buy_text,
         "risk_flags": "、".join(risk_flags),
+        "habit_note": habit_note,
+        "local_note": local_note,
+        "win_note": win_note,
     }
 
 
@@ -3653,11 +3759,19 @@ def build_branch_report_message() -> str:
         return "\n".join(lines)
 
     for index, item in enumerate(ok_items[:limit], start=1):
+        avg_price_text = []
+        if float(item.get("top_buy_avg_price") or 0.0) > 0:
+            avg_price_text.append(f"大戶買均 {item['top_buy_avg_price']:.2f}")
+        if float(item.get("top_sell_avg_price") or 0.0) > 0:
+            avg_price_text.append(f"大戶賣均 {item['top_sell_avg_price']:.2f}")
         lines.extend(
             [
                 f"{index}. {item['stock_id']} {item['stock_name']}｜分點觀察 {item['branch_score']:.1f}",
                 f"交易日 {item['trade_date']}｜前5買超占買量 {item['concentration'] * 100:.1f}%｜前5賣超占賣量 {item['sell_concentration'] * 100:.1f}%",
                 f"主買：{item['buy_text']}",
+                f"均價：{'｜'.join(avg_price_text) if avg_price_text else '資料不足'}",
+                f"習性：{item.get('habit_note', '待觀察')}",
+                f"地緣/勝率：{item.get('local_note', '待觀察')}｜{item.get('win_note', '追蹤中')}",
                 f"判讀：{item['risk_flags']}｜此為籌碼觀察，不代表買賣建議",
             ]
         )
