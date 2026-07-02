@@ -68,6 +68,7 @@ DATA_SOURCE_STATUS = {
     "exit_alerts": "unknown",
     "gemini_review": "disabled",
 }
+FINMIND_REQUEST_COUNT = 0
 
 THEME_BY_STOCK_ID: dict[str, str] | None = None
 
@@ -446,6 +447,11 @@ def cache_is_fresh_enough(record: dict[str, Any] | None) -> bool:
 
 
 def request_finmind(dataset: str, params: dict[str, str], timeout: int = 60) -> list[dict[str, Any]]:
+    global FINMIND_REQUEST_COUNT
+    max_requests = env_int("AI_STOCK_FINMIND_MAX_REQUESTS", 450)
+    if max_requests > 0 and FINMIND_REQUEST_COUNT >= max_requests:
+        raise RuntimeError(f"FinMind request budget exceeded ({FINMIND_REQUEST_COUNT}/{max_requests})")
+    FINMIND_REQUEST_COUNT += 1
     query = {"dataset": dataset, **params}
     token = os.getenv("FINMIND_TOKEN", "").strip()
     headers = {"User-Agent": "Mozilla/5.0"}

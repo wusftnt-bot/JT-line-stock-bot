@@ -24,6 +24,7 @@ jobs:
       DAILY_FINANCE_REPORT_URL: "https://wusftnt-bot.github.io/daily-finance-report/"
       FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
       AI_STOCK_BRANCH_REPORT_LIMIT: "8"
+      AI_STOCK_FINMIND_MAX_REQUESTS: "80"
       AI_STOCK_MAX_RUNTIME_SEC: "900"
     steps:
       - name: Checkout
