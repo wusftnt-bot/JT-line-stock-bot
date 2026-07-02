@@ -508,9 +508,6 @@ def fetch_finmind_trading_daily_report(stock_id: str, trade_date: str) -> list[d
     if not os.getenv("FINMIND_TOKEN", "").strip():
         raise RuntimeError("Missing FINMIND_TOKEN for TaiwanStockTradingDailyReport.")
     date_text = format_trade_date(trade_date)
-    if "/" in date_text:
-        parts = date_text.split("/")
-        date_text = f"{int(parts[0]):04d}-{int(parts[1]):02d}-{int(parts[2]):02d}"
     cache_name = f"finmind_trading_daily_report_{date_text}_{stock_id}"
     cached = read_cache(cache_name)
     if isinstance(cached, list):
@@ -3724,6 +3721,23 @@ def today_strategy_entries() -> list[dict[str, Any]]:
     return []
 
 
+def readable_branch_error(error: Exception) -> str:
+    if isinstance(error, HTTPError):
+        if error.code == 400:
+            return "HTTP 400 資料格式/日期不支援"
+        if error.code in {401, 403}:
+            return f"HTTP {error.code} 權限不足"
+        if error.code == 429:
+            return "HTTP 429 額度限制"
+        return f"HTTP {error.code}"
+    text = str(error)
+    if "request budget exceeded" in text:
+        return "FinMind 額度保護"
+    if "Missing FINMIND_TOKEN" in text:
+        return "缺 FINMIND_TOKEN"
+    return type(error).__name__
+
+
 def build_branch_report_message() -> str:
     entries = today_strategy_entries()
     if not entries:
@@ -3746,7 +3760,7 @@ def build_branch_report_message() -> str:
         try:
             summaries.append(summarize_trading_daily_report(entry))
         except Exception as error:
-            errors.append(f"{entry.get('stock_id')}:{type(error).__name__}")
+            errors.append(f"{entry.get('stock_id')}:{readable_branch_error(error)}")
             continue
         time.sleep(0.25)
 
