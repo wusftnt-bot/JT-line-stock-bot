@@ -504,24 +504,6 @@ def fetch_finmind_institutional_records(stock_id: str, days: int = 45) -> list[d
     return sorted(grouped.values(), key=lambda item: item["date"], reverse=True)
 
 
-def fetch_finmind_trading_daily_report(stock_id: str, trade_date: str) -> list[dict[str, Any]]:
-    if not os.getenv("FINMIND_TOKEN", "").strip():
-        raise RuntimeError("Missing FINMIND_TOKEN for TaiwanStockTradingDailyReport.")
-    date_text = format_trade_date(trade_date)
-    cache_name = f"finmind_trading_daily_report_{date_text}_{stock_id}"
-    cached = read_cache(cache_name)
-    if isinstance(cached, list):
-        return cached
-    rows = request_finmind(
-        "TaiwanStockTradingDailyReport",
-        {"data_id": stock_id, "start_date": date_text, "end_date": date_text},
-        timeout=45,
-    )
-    filtered = [row for row in rows if str(row.get("stock_id") or stock_id).strip() == stock_id]
-    write_cache(cache_name, filtered)
-    return filtered
-
-
 def fetch_finmind_margin_record(stock_id: str, days: int = 14) -> dict[str, float]:
     start_date = (datetime.now(TAIPEI_TZ).date() - timedelta(days=days)).strftime("%Y-%m-%d")
     rows = request_finmind("TaiwanStockMarginPurchaseShortSale", {"data_id": stock_id, "start_date": start_date}, timeout=45)
@@ -3376,20 +3358,20 @@ def compact_for_gemini(row: StockRow, bucket: str) -> dict[str, Any]:
     }
 
 
+
 def gemini_prompt(candidates: list[dict[str, Any]]) -> str:
     payload = {
         "instructions": [
-            "你是台股候選股質化審查員，只能根據提供的資料判斷，不可編造新聞、法說會或未提供的財報文字。",
-            "請輔助既有量化模型，不要給買賣指令，不要用保證語氣。",
-            "重點檢查：財務品質、月營收可持續性、法人籌碼是否一致、短線題材或過熱風險、是否需要等待量縮或回測。",
-            "若缺少新聞、法說會或財報文字來源，請在風險中用簡短文字指出。",
-            "只回 JSON array，每個元素包含 stock_id, catalyst, risk, sustainability, theme_quality, confidence, summary。",
-            "confidence 使用 0-10 整數；summary 限 45 個中文字內。",
+            "你是台股候選名單覆判助理，只能根據 candidates 內提供的結構化資料判斷。",
+            "不要自行補充未提供的新聞、法說會、未公開消息或即時行情；資料不足時請明確寫資料不足。",
+            "請評估：正向催化、負面風險、成長是否可持續、題材品質、信心分數與一句摘要。",
+            "請用繁體中文，避免英文代碼式文字，摘要務必短而清楚。",
+            "只回傳 JSON array，每筆包含 stock_id, catalyst, risk, sustainability, theme_quality, confidence, summary。",
+            "confidence 使用 0-10 數字；summary 最多 45 個中文字。",
         ],
         "candidates": candidates,
     }
     return json.dumps(payload, ensure_ascii=False, default=str)
-
 
 def parse_json_array_from_text(text: str) -> list[dict[str, Any]]:
     cleaned = text.strip()
@@ -3530,6 +3512,7 @@ def attach_gemini_reviews(
     DATA_SOURCE_STATUS["gemini_review"] = f"enabled reviewed={len(reviews)} attached={attached}"
 
 
+
 def format_ai_review(row: StockRow) -> str | None:
     review = row.get("ai_review")
     if not isinstance(review, dict):
@@ -3542,172 +3525,249 @@ def format_ai_review(row: StockRow) -> str | None:
         confidence_text = f"{float(confidence):.0f}/10"
     except (TypeError, ValueError):
         confidence_text = "?/10"
-    return f"AI摘要：{summary}｜信心 {confidence_text}"
+    return f"AI覆判：{summary}｜信心 {confidence_text}"
 
 
-def trading_report_number(row: dict[str, Any], aliases: list[str]) -> float:
-    for alias in aliases:
-        if alias in row:
-            return clean_number(row.get(alias))
+def entry_float(entry: dict[str, Any], *names: str) -> float:
+    for name in names:
+        value = entry.get(name)
+        if value not in (None, ""):
+            return clean_number(value)
     return 0.0
 
 
-def trading_report_records(stock_id: str, trade_date: str) -> list[dict[str, Any]]:
-    rows = fetch_finmind_trading_daily_report(stock_id, trade_date)
-    records: list[dict[str, Any]] = []
-    for row in rows:
-        broker_id = str(row.get("securities_trader_id") or row.get("SecuritiesBrokerId") or "").strip()
-        broker_name = str(row.get("securities_trader") or row.get("SecuritiesBrokerName") or broker_id or "unknown").strip()
-        buy = trading_report_number(row, ["buy", "BuyNum", "Buy", "buy_num"])
-        sell = trading_report_number(row, ["sell", "SellNum", "Sell", "sell_num"])
-        buy_price = trading_report_number(row, ["buy_price", "BuyPrice", "BuyAvgPrice", "price"])
-        sell_price = trading_report_number(row, ["sell_price", "SellPrice", "SellAvgPrice", "price"])
-        net = buy - sell
-        if buy == 0 and sell == 0:
-            continue
-        records.append(
-            {
-                "broker": broker_name[:16],
-                "broker_id": broker_id,
-                "key": broker_id or broker_name,
-                "buy": buy,
-                "sell": sell,
-                "net": net,
-                "buy_price": buy_price,
-                "sell_price": sell_price,
-            }
-        )
-    return records
+def lots_text(value: float) -> str:
+    return f"{shares_to_lots(value):,.0f}張"
 
 
-def weighted_average_price(records: list[dict[str, Any]], qty_key: str, price_key: str) -> float:
-    total_qty = sum(max(float(item.get(qty_key) or 0.0), 0.0) for item in records if float(item.get(price_key) or 0.0) > 0)
-    if total_qty <= 0:
-        return 0.0
-    weighted = sum(
-        max(float(item.get(qty_key) or 0.0), 0.0) * float(item.get(price_key) or 0.0)
-        for item in records
-        if float(item.get(price_key) or 0.0) > 0
-    )
-    return round(weighted / total_qty, 2)
+def source_label(source: Any) -> str:
+    labels = {
+        "top": "正式Top",
+        "opportunity": "機會股",
+        "watchlist": "Watchlist",
+        "radar": "法人建倉雷達",
+    }
+    return labels.get(str(source or ""), str(source or "候選"))
 
 
-def branch_lookback_dates(trade_date: str, days: int) -> list[str]:
-    base_text = format_trade_date(trade_date)
-    try:
-        base_date = datetime.strptime(base_text, "%Y-%m-%d").date()
-    except ValueError:
-        base_date = datetime.now(TAIPEI_TZ).date()
-    dates: list[str] = []
-    offset = 1
-    while len(dates) < days and offset <= days * 3:
-        day = base_date - timedelta(days=offset)
-        if day.weekday() < 5:
-            dates.append(day.strftime("%Y-%m-%d"))
-        offset += 1
-    return dates
+def review_grade(score: float) -> str:
+    if score >= 75:
+        return "覆判偏多"
+    if score >= 60:
+        return "續觀察"
+    if score >= 45:
+        return "中性等待"
+    return "風險升高"
 
 
-def broker_key(record: dict[str, Any]) -> str:
-    return str(record.get("key") or record.get("broker_id") or record.get("broker") or "")
+def review_action(score: float, risks: list[str]) -> str:
+    if "今日重跌" in risks or "法人近2日偏賣" in risks:
+        return "先降權重，等待賣壓收斂後再評估。"
+    if score >= 75:
+        return "可列優先觀察，仍等量縮回測或盤中承接確認。"
+    if score >= 60:
+        return "維持觀察，避免追高，留意法人是否延續買超。"
+    if score >= 45:
+        return "訊號尚未完整，等待基本面或籌碼再確認。"
+    return "暫不列入積極名單。"
 
 
-def broker_habit_notes(stock_id: str, trade_date: str, top_buy: list[dict[str, Any]], concentration: float) -> tuple[str, str, str]:
-    if not top_buy:
-        return "無明顯主力分點", "分點勝率：待累積", "無"
-    daytrade_keywords = ["凱基台北", "台北", "美商高盛", "高盛", "摩根", "美林", "港商野村", "瑞銀"]
-    local_keywords = ["新竹", "竹科", "台南", "南科", "高雄", "台中", "桃園", "內湖", "汐止"]
-    top_keys = {broker_key(item) for item in top_buy[:3] if broker_key(item)}
-    history: dict[str, dict[str, float]] = {key: {"positive_days": 0, "sell_days": 0, "net_sum": 0.0} for key in top_keys}
-    for date_text in branch_lookback_dates(trade_date, env_int("AI_STOCK_BRANCH_LOOKBACK_DAYS", 5)):
-        try:
-            records = trading_report_records(stock_id, date_text)
-        except Exception:
-            continue
-        by_key = {broker_key(item): item for item in records if broker_key(item) in top_keys}
-        for key, item in by_key.items():
-            net = float(item.get("net") or 0.0)
-            if net > 0:
-                history[key]["positive_days"] += 1
-                history[key]["net_sum"] += net
-            if float(item.get("sell") or 0.0) > 0:
-                history[key]["sell_days"] += 1
+def summarize_free_chip_review(entry: dict[str, Any]) -> dict[str, Any]:
+    foreign_5d = entry_float(entry, "foreign_5d_sum")
+    trust_5d = entry_float(entry, "trust_5d_sum")
+    foreign_10d = entry_float(entry, "foreign_10d_sum")
+    trust_10d = entry_float(entry, "trust_10d_sum")
+    latest_foreign = entry_float(entry, "latest_foreign_net")
+    latest_trust = entry_float(entry, "latest_trust_net")
+    latest_inst = entry_float(entry, "latest_institutional_net")
+    recent_2d = entry_float(entry, "recent_2d_institutional_net")
+    price_1d = entry_float(entry, "entry_price_change_1d", "price_change_1d")
+    price_20d = entry_float(entry, "entry_price_change_20d", "price_change_20d")
+    volume_ratio = entry_float(entry, "entry_volume_ratio", "volume_ratio")
+    total_score = entry_float(entry, "total_score")
+    fundamental_score = entry_float(entry, "fundamental_score")
+    valuation_score = entry_float(entry, "valuation_score")
+    eps_acceleration_score = entry_float(entry, "eps_acceleration_score")
 
-    top_names = " ".join(str(item.get("broker") or "") for item in top_buy[:3])
-    notes: list[str] = []
-    if any(keyword in top_names for keyword in daytrade_keywords) and concentration >= 0.10:
-        notes.append("隔日沖分點疑慮")
-    wave_names = []
-    for item in top_buy[:3]:
-        key = broker_key(item)
-        stats = history.get(key, {})
-        if stats.get("positive_days", 0) >= 3 and stats.get("sell_days", 0) <= 1:
-            wave_names.append(str(item.get("broker") or ""))
-    if wave_names:
-        notes.append(f"波段布局跡象：{ '、'.join(wave_names[:2]) }")
-    if not notes:
-        notes.append("主力習性：待觀察")
+    score = 50.0
+    positives: list[str] = []
+    risks: list[str] = []
 
-    local_names = [str(item.get("broker") or "") for item in top_buy[:5] if any(keyword in str(item.get("broker") or "") for keyword in local_keywords)]
-    local_note = f"在地分點異動：{ '、'.join(local_names[:2]) }" if local_names else "在地分點：無明顯異動"
-    win_note = "分點勝率：追蹤中，需累積後續報酬"
-    return "；".join(notes), win_note, local_note
+    if trust_5d > 0:
+        score += 12
+        positives.append("投信5日買超")
+    if trust_10d > 0:
+        score += 8
+        positives.append("投信10日偏買")
+    if latest_trust > 0:
+        score += 5
+        positives.append("投信今日買超")
+    elif latest_trust < 0:
+        score -= 8
+        risks.append("投信今日賣超")
 
+    if foreign_5d > 0:
+        score += 10
+        positives.append("外資5日買超")
+    if foreign_10d > 0:
+        score += 7
+        positives.append("外資10日偏買")
+    if latest_foreign > 0:
+        score += 5
+        positives.append("外資今日買超")
+    elif latest_foreign < 0:
+        score -= 8
+        risks.append("外資今日賣超")
 
-def summarize_trading_daily_report(entry: dict[str, Any]) -> dict[str, Any]:
-    stock_id = str(entry.get("stock_id") or "")
-    stock_name = str(entry.get("stock_name") or "")
-    trade_date = str(entry.get("latest_trade_date") or entry.get("date") or datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d"))
-    records = trading_report_records(stock_id, trade_date)
+    if latest_inst < 0 and recent_2d < 0:
+        score -= 15
+        risks.append("法人近2日偏賣")
+    if price_1d <= -6:
+        score -= 18
+        risks.append("今日重跌")
+    elif price_1d <= -4:
+        score -= 10
+        risks.append("單日跌幅偏重")
+    if price_20d >= 30:
+        score -= 8
+        risks.append("20日漲幅偏高")
+    if volume_ratio >= 2.5:
+        score -= 6
+        risks.append("量能過熱")
+    elif 0.8 <= volume_ratio <= 1.8:
+        score += 5
+        positives.append("量能溫和")
 
-    if not records:
-        return {"stock_id": stock_id, "stock_name": stock_name, "source": entry.get("source"), "status": "no_data"}
+    risk_notes = entry.get("risk_notes")
+    if isinstance(risk_notes, list):
+        if "margin_risk" in risk_notes:
+            score -= 8
+            risks.append("融資風險")
+        if "low_liquidity" in risk_notes:
+            score -= 8
+            risks.append("流動性不足")
+        if "heavy_1d_drop" in risk_notes and "單日跌幅偏重" not in risks and "今日重跌" not in risks:
+            score -= 8
+            risks.append("單日跌幅偏重")
 
-    total_buy = sum(max(float(item["buy"]), 0.0) for item in records)
-    total_sell = sum(max(float(item["sell"]), 0.0) for item in records)
-    top_buy = [item for item in sorted(records, key=lambda item: item["net"], reverse=True)[:5] if item["net"] > 0]
-    top_sell = [item for item in sorted(records, key=lambda item: item["net"])[:5] if item["net"] < 0]
-    top_buy_net = sum(float(item["net"]) for item in top_buy)
-    top_sell_net = abs(sum(float(item["net"]) for item in top_sell))
-    concentration = top_buy_net / total_buy if total_buy > 0 else 0.0
-    sell_concentration = top_sell_net / total_sell if total_sell > 0 else 0.0
-    buy_text = "、".join(f"{item['broker']} {shares_to_lots(float(item['net'])):,.0f}張" for item in top_buy[:3]) or "無明顯集中買方"
-    top_buy_avg_price = weighted_average_price(top_buy, "buy", "buy_price")
-    top_sell_avg_price = weighted_average_price(top_sell, "sell", "sell_price")
-    habit_note, win_note, local_note = broker_habit_notes(stock_id, trade_date, top_buy, concentration)
-    risk_flags = []
-    if concentration >= 0.18:
-        risk_flags.append("買方集中")
-    elif concentration >= 0.10:
-        risk_flags.append("買方略集中")
-    else:
-        risk_flags.append("買方分散")
-    if sell_concentration >= 0.18 and top_sell_net >= top_buy_net * 0.8:
-        risk_flags.append("賣壓集中")
-    if total_buy > 0 and total_sell > 0 and top_buy_net < top_sell_net:
-        risk_flags.append("主賣壓較強")
+    if entry.get("top_quality_pass") is True:
+        score += 8
+        positives.append("通過品質門檻")
+    elif entry.get("top_quality_pass") is False:
+        score -= 8
+        reason = str(entry.get("top_quality_reason") or "").replace(",", "、")
+        risks.append(f"品質門檻未過{f'：{reason}' if reason else ''}")
 
-    score = 50.0 + clip(concentration * 100, 0, 25) - clip(sell_concentration * 60 if top_sell_net >= top_buy_net * 0.8 else 0, 0, 20)
+    if fundamental_score >= 30:
+        score += 5
+        positives.append("基本面分數高")
+    if valuation_score <= 5:
+        risks.append("估值訊號偏保守")
+    if eps_acceleration_score > 0:
+        positives.append("EPS加速加分")
+
+    score = round(clip(score, 0, 100), 1)
     return {
-        "stock_id": stock_id,
-        "stock_name": stock_name,
+        "stock_id": str(entry.get("stock_id") or ""),
+        "stock_name": str(entry.get("stock_name") or ""),
         "source": entry.get("source"),
         "rank": entry.get("rank"),
-        "trade_date": format_trade_date(trade_date),
-        "status": "ok",
-        "branch_score": round(clip(score, 0, 100), 1),
-        "concentration": concentration,
-        "sell_concentration": sell_concentration,
-        "top_buy_lots": shares_to_lots(top_buy_net),
-        "top_sell_lots": shares_to_lots(top_sell_net),
-        "top_buy_avg_price": top_buy_avg_price,
-        "top_sell_avg_price": top_sell_avg_price,
-        "buy_text": buy_text,
-        "risk_flags": "、".join(risk_flags),
-        "habit_note": habit_note,
-        "local_note": local_note,
-        "win_note": win_note,
+        "grade": str(entry.get("model_grade") or "?"),
+        "total_score": total_score,
+        "review_score": score,
+        "review_grade": review_grade(score),
+        "industry": _readable_theme(entry.get("industry_theme") or entry.get("industry_category")),
+        "foreign_5d": foreign_5d,
+        "trust_5d": trust_5d,
+        "foreign_10d": foreign_10d,
+        "trust_10d": trust_10d,
+        "latest_inst": latest_inst,
+        "recent_2d": recent_2d,
+        "price_1d": price_1d,
+        "price_20d": price_20d,
+        "volume_ratio": volume_ratio,
+        "positives": positives[:5],
+        "risks": risks[:5],
+        "action": review_action(score, risks),
+        "entry": entry,
     }
+
+
+def compact_entry_for_gemini(item: dict[str, Any]) -> dict[str, Any]:
+    entry = item.get("entry") if isinstance(item.get("entry"), dict) else {}
+    return {
+        "bucket": source_label(item.get("source")),
+        "stock_id": item.get("stock_id"),
+        "stock_name": item.get("stock_name"),
+        "grade": item.get("grade"),
+        "total_score": item.get("total_score"),
+        "review_score": item.get("review_score"),
+        "review_grade": item.get("review_grade"),
+        "industry": item.get("industry"),
+        "fundamental_score": entry.get("fundamental_score"),
+        "technical_score": entry.get("technical_score"),
+        "chip_score": entry.get("chip_score"),
+        "valuation_score": entry.get("valuation_score"),
+        "industry_score": entry.get("industry_score"),
+        "eps_acceleration_score": entry.get("eps_acceleration_score"),
+        "monthly_revenue_yoy": entry.get("yoy"),
+        "monthly_revenue_mom": entry.get("mom"),
+        "accumulated_revenue_yoy": entry.get("acc_yoy"),
+        "eps": entry.get("eps"),
+        "roe": entry.get("roe"),
+        "gross_margin": entry.get("gross_margin"),
+        "operating_margin": entry.get("operating_margin"),
+        "net_margin": entry.get("net_margin"),
+        "pe_ratio": entry.get("pe_ratio"),
+        "pbr": entry.get("pbr"),
+        "price_change_1d": item.get("price_1d"),
+        "price_change_20d": item.get("price_20d"),
+        "volume_ratio": item.get("volume_ratio"),
+        "foreign_5d_lots": shares_to_lots(float(item.get("foreign_5d") or 0.0)),
+        "trust_5d_lots": shares_to_lots(float(item.get("trust_5d") or 0.0)),
+        "foreign_10d_lots": shares_to_lots(float(item.get("foreign_10d") or 0.0)),
+        "trust_10d_lots": shares_to_lots(float(item.get("trust_10d") or 0.0)),
+        "latest_institutional_lots": shares_to_lots(float(item.get("latest_inst") or 0.0)),
+        "recent_2d_institutional_lots": shares_to_lots(float(item.get("recent_2d") or 0.0)),
+        "positive_factors": item.get("positives"),
+        "risk_factors": item.get("risks"),
+        "opportunity_reason": entry.get("opportunity_reason"),
+        "top_quality_reason": entry.get("top_quality_reason"),
+        "risk_notes": entry.get("risk_notes"),
+    }
+
+
+def attach_gemini_reviews_to_review_items(items: list[dict[str, Any]]) -> None:
+    limit = env_int("AI_STOCK_GEMINI_REVIEW_LIMIT", 6)
+    if limit <= 0:
+        DATA_SOURCE_STATUS["gemini_review"] = "disabled limit=0"
+        return
+    candidates = [compact_entry_for_gemini(item) for item in items[:limit]]
+    if not candidates:
+        DATA_SOURCE_STATUS["gemini_review"] = "empty"
+        return
+    try:
+        reviews = request_gemini_reviews(candidates)
+    except Exception as error:
+        DATA_SOURCE_STATUS["gemini_review"] = f"failed {type(error).__name__}"
+        print(f"GEMINI_REVIEW_FAILED {type(error).__name__}: {error}")
+        return
+    by_stock = {str(item.get("stock_id") or ""): item for item in reviews}
+    attached = 0
+    for item in items:
+        review = by_stock.get(str(item.get("stock_id") or ""))
+        if not review:
+            continue
+        summary = str(review.get("summary") or "").strip()
+        if not summary:
+            continue
+        item["ai_review"] = {
+            "summary": summary[:90],
+            "risk": str(review.get("risk") or "").strip()[:80],
+            "confidence": review.get("confidence"),
+        }
+        attached += 1
+    DATA_SOURCE_STATUS["gemini_review"] = f"enabled reviewed={len(reviews)} attached={attached}"
 
 
 def today_strategy_entries() -> list[dict[str, Any]]:
@@ -3721,84 +3781,62 @@ def today_strategy_entries() -> list[dict[str, Any]]:
     return []
 
 
-def readable_branch_error(error: Exception) -> str:
-    if isinstance(error, HTTPError):
-        if error.code == 400:
-            return "HTTP 400 資料格式/日期不支援"
-        if error.code in {401, 403}:
-            return f"HTTP {error.code} 權限不足"
-        if error.code == 429:
-            return "HTTP 429 額度限制"
-        return f"HTTP {error.code}"
-    text = str(error)
-    if "request budget exceeded" in text:
-        return "FinMind 額度保護"
-    if "Missing FINMIND_TOKEN" in text:
-        return "缺 FINMIND_TOKEN"
-    return type(error).__name__
-
-
 def build_branch_report_message() -> str:
     entries = today_strategy_entries()
     if not entries:
         return (
-            "AI Stock Bot V2 分點二次篩選\n"
+            "AI Stock Bot V2 AI覆判與籌碼風險檢查\n"
+            f"完整財經看板：{DAILY_FINANCE_REPORT_URL}\n\n"
             "====================\n"
-            "今日尚未找到 20:00 主推播候選名單，暫不進行分點二次篩選。"
-        )
-    if not os.getenv("FINMIND_TOKEN", "").strip():
-        return (
-            "AI Stock Bot V2 分點二次篩選\n"
-            "====================\n"
-            "尚未設定 FINMIND_TOKEN，無法查詢 TaiwanStockTradingDailyReport。"
+            "尚未找到今日 20:00 主推播候選名單，暫不進行第二層覆判。\n"
+            "請先確認第一則主推播 workflow 是否已完成並寫入候選追蹤快取。"
         )
 
     limit = env_int("AI_STOCK_BRANCH_REPORT_LIMIT", 8)
-    summaries = []
-    errors: list[str] = []
-    for entry in entries[:limit]:
-        try:
-            summaries.append(summarize_trading_daily_report(entry))
-        except Exception as error:
-            errors.append(f"{entry.get('stock_id')}:{readable_branch_error(error)}")
-            continue
-        time.sleep(0.25)
+    source_order = {"top": 0, "opportunity": 1, "radar": 2, "watchlist": 3}
+    ranked_entries = sorted(
+        entries,
+        key=lambda item: (
+            source_order.get(str(item.get("source") or ""), 9),
+            -entry_float(item, "total_score", "opportunity_score", "accumulation_score"),
+        ),
+    )
+    review_items = [summarize_free_chip_review(entry) for entry in ranked_entries[: max(limit, 1)]]
+    review_items.sort(key=lambda item: float(item.get("review_score") or 0.0), reverse=True)
+    attach_gemini_reviews_to_review_items(review_items)
 
-    ok_items = [item for item in summaries if item.get("status") == "ok"]
-    ok_items.sort(key=lambda item: float(item.get("branch_score") or 0.0), reverse=True)
     lines = [
-        "AI Stock Bot V2 分點二次篩選",
+        "AI Stock Bot V2 AI覆判與籌碼風險檢查",
         f"完整財經看板：{DAILY_FINANCE_REPORT_URL}",
         "",
-        "說明：針對 20:00 主推播候選名單，使用 FinMind 每日買賣日報做第二層觀察；目前只顯示，不改主模型分數。",
+        "說明：針對20:00主推播候選名單，使用既有TWSE/TPEx法人、價量、基本面、估值與風險欄位做第二層覆判；目前不使用FinMind分點資料，也不改主模型分數。",
         "====================",
+        f"覆判名單：{len(review_items)} 檔｜Gemini：{DATA_SOURCE_STATUS.get('gemini_review', 'unknown')}",
     ]
-    if not ok_items:
-        reason = "；".join(errors[:3]) if errors else "FinMind 尚未提供今日分點資料或權限不足"
-        lines.extend(["今日分點資料尚未完成", f"原因：{reason}"])
-        return "\n".join(lines)
 
-    for index, item in enumerate(ok_items[:limit], start=1):
-        avg_price_text = []
-        if float(item.get("top_buy_avg_price") or 0.0) > 0:
-            avg_price_text.append(f"大戶買均 {item['top_buy_avg_price']:.2f}")
-        if float(item.get("top_sell_avg_price") or 0.0) > 0:
-            avg_price_text.append(f"大戶賣均 {item['top_sell_avg_price']:.2f}")
+    for index, item in enumerate(review_items[:limit], start=1):
+        positives = "、".join(item.get("positives") or []) or "尚無明顯加分訊號"
+        risks = "、".join(item.get("risks") or []) or "未見主要風險"
+        ai_review = item.get("ai_review") if isinstance(item.get("ai_review"), dict) else {}
+        ai_summary = str(ai_review.get("summary") or "").strip()
+        confidence = ai_review.get("confidence")
+        try:
+            confidence_text = f"{float(confidence):.0f}/10"
+        except (TypeError, ValueError):
+            confidence_text = "未啟用"
         lines.extend(
             [
-                f"{index}. {item['stock_id']} {item['stock_name']}｜分點觀察 {item['branch_score']:.1f}",
-                f"交易日 {item['trade_date']}｜前5買超占買量 {item['concentration'] * 100:.1f}%｜前5賣超占賣量 {item['sell_concentration'] * 100:.1f}%",
-                f"主買：{item['buy_text']}",
-                f"均價：{'｜'.join(avg_price_text) if avg_price_text else '資料不足'}",
-                f"習性：{item.get('habit_note', '待觀察')}",
-                f"地緣/勝率：{item.get('local_note', '待觀察')}｜{item.get('win_note', '追蹤中')}",
-                f"判讀：{item['risk_flags']}｜此為籌碼觀察，不代表買賣建議",
+                f"{index}. {item['stock_id']} {item['stock_name']}｜覆判 {item['review_score']:.1f}｜{item['review_grade']}",
+                f"{source_label(item.get('source'))}｜{item['grade']}級｜總分 {item['total_score']:.1f}｜{item['industry']}",
+                f"籌碼：外資5日 {lots_text(item['foreign_5d'])} / 投信5日 {lots_text(item['trust_5d'])}｜今日法人 {lots_text(item['latest_inst'])}｜近2日 {lots_text(item['recent_2d'])}",
+                f"價量：1日 {item['price_1d']:.1f}%｜20日 {item['price_20d']:.1f}%｜量比 {item['volume_ratio']:.2f}x",
+                f"加分：{positives}",
+                f"風險：{risks}",
+                f"AI摘要：{ai_summary if ai_summary else 'Gemini未回傳摘要'}｜信心 {confidence_text}",
+                f"結論：{item['action']}",
             ]
         )
-    if errors:
-        lines.extend(["====================", f"未完成查詢：{'; '.join(errors[:5])}"])
     return "\n".join(lines)
-
 
 def write_csv(path: Path, rows: list[StockRow]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -3956,6 +3994,9 @@ def write_strategy_tracker(
             "market_type": row.get("market_type"),
             "industry_category": row.get("industry_category"),
             "industry_theme": row.get("industry_theme"),
+            "yoy": row.get("yoy"),
+            "mom": row.get("mom"),
+            "acc_yoy": row.get("acc_yoy"),
             "entry_close": row.get("close"),
             "latest_trade_date": row.get("latest_trade_date"),
             "institutional_trade_date": row.get("institutional_trade_date"),
@@ -3985,6 +4026,9 @@ def write_strategy_tracker(
             "net_income": row.get("net_income"),
             "equity": row.get("equity"),
             "roe": row.get("roe"),
+            "gross_margin": row.get("gross_margin"),
+            "operating_margin": row.get("operating_margin"),
+            "net_margin": row.get("net_margin"),
             "pe_ratio": row.get("pe_ratio"),
             "pbr": row.get("pbr"),
             "operating_cash_flow": row.get("operating_cash_flow"),
@@ -4076,7 +4120,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="AI V2 stock selection bot for TWSE stocks.")
     parser.add_argument("--push-line", action="store_true", help="Push the report through LINE Messaging API.")
     parser.add_argument("--write-report", action="store_true", help="Write the report under reports/.")
-    parser.add_argument("--branch-report", action="store_true", help="Push a FinMind broker daily-report follow-up for today's candidates.")
+    parser.add_argument("--branch-report", action="store_true", help="Push an AI review and institutional-risk follow-up for today's candidates.")
     args = parser.parse_args()
 
     started_at = datetime.now(TAIPEI_TZ)
