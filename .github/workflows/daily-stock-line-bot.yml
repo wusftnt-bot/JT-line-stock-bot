@@ -19,6 +19,14 @@ on:
         options:
           - "false"
           - "true"
+      force_fresh_push:
+        description: "Official external scheduler only: ignore an existing sent marker and run the 20:00 push."
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
   schedule:
     # 19:40-20:30 Asia/Taipei every 5 minutes. GitHub Actions schedules use UTC.
     # Frequent slots reduce best-effort schedule misses; sent marker and concurrency prevent duplicates.
@@ -136,6 +144,7 @@ jobs:
           else
             echo "should_mark_sent=false" >> "$GITHUB_OUTPUT"
           fi
+          echo "force_fresh_push=${{ inputs.force_fresh_push || 'false' }}" >> "$GITHUB_OUTPUT"
 
       - name: Guard scheduled push window
         id: push-window
@@ -162,7 +171,7 @@ jobs:
         if: steps.push-window.outputs.allowed == 'true'
         shell: bash
         run: |
-          if [ "${{ steps.taipei.outputs.should_mark_sent }}" = "true" ] && [ "${{ steps.sent-cache.outputs.cache-hit }}" = "true" ]; then
+          if [ "${{ steps.taipei.outputs.should_mark_sent }}" = "true" ] && [ "${{ steps.sent-cache.outputs.cache-hit }}" = "true" ] && [ "${{ steps.taipei.outputs.force_fresh_push }}" != "true" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "LINE stock bot already sent today via cache marker."
           else
