@@ -4132,8 +4132,11 @@ def main() -> None:
         print(message)
         counts = {"top": 0, "opportunity": 0, "watchlist": 0, "radar": 0, "exit": 0}
         print_run_metrics("branch_report_complete", started_at, started_perf, counts)
-        if push_enabled:
+        empty_review = "尚未找到今日 20:00 主推播候選名單" in message
+        if push_enabled and not (empty_review and env_bool("AI_STOCK_SUPPRESS_EMPTY_REVIEW_PUSH", False)):
             push_line_message(message)
+        elif push_enabled and empty_review:
+            print("AI_REVIEW_EMPTY_SUPPRESSED no LINE push; waiting for a later retry slot.")
         print_run_metrics("finished", started_at, started_perf, counts)
         return
 
@@ -4148,6 +4151,8 @@ def main() -> None:
         message = build_line_message(top_stocks, opportunity_stocks, watchlist_stocks, radar_stocks, exit_alerts)
     except Exception as error:
         if not push_enabled:
+            raise
+        if isinstance(error, RunDeadlineExceeded):
             raise
         if is_pre_close_error(error):
             raise

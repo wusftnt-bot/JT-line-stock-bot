@@ -3,8 +3,10 @@ name: line-stock-ai-review
 on:
   workflow_dispatch:
   schedule:
-    # 21:10 Asia/Taipei, Monday-Friday. GitHub Actions schedules use UTC.
+    # 21:10-21:55 Asia/Taipei retries, Monday-Friday. GitHub Actions schedules use UTC.
+    # If the 20:00 primary analysis finishes late, later slots can still send the AI review.
     - cron: "10 13 * * 1-5"
+    - cron: "25,40,55 13 * * 1-5"
 
 concurrency:
   group: line-stock-ai-review-${{ github.ref }}
@@ -28,6 +30,7 @@ jobs:
       GEMINI_MODEL_SEQUENCE: "gemini-2.5-flash-lite,gemini-2.5-flash"
       GEMINI_RETRY: "1"
       GEMINI_TIMEOUT_SEC: "20"
+      AI_STOCK_SUPPRESS_EMPTY_REVIEW_PUSH: "true"
       AI_STOCK_MAX_RUNTIME_SEC: "900"
     steps:
       - name: Checkout
@@ -50,7 +53,7 @@ jobs:
         shell: bash
         run: |
           hm="${{ steps.taipei.outputs.hm }}"
-          if [ "${{ github.event_name }}" = "schedule" ] && { [ "$hm" -lt 2110 ] || [ "$hm" -gt 2140 ]; }; then
+          if [ "${{ github.event_name }}" = "schedule" ] && { [ "$hm" -lt 2110 ] || [ "$hm" -gt 2200 ]; }; then
             echo "allowed=false" >> "$GITHUB_OUTPUT"
             echo "AI review schedule fired outside Taipei window; skip push. taipei_hm=$hm"
           else
@@ -70,7 +73,7 @@ jobs:
         if: steps.push-window.outputs.allowed == 'true'
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "schedule" ] && [ "${{ steps.sent-cache.outputs.cache-hit }}" = "true" ]; then
+          if [ "${{ steps.sent-cache.outputs.cache-hit }}" = "true" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "LINE AI review already sent today via cache marker."
           else
@@ -94,19 +97,27 @@ jobs:
           python-version: "3.11"
 
       - name: Run AI review and push LINE message
+        id: review
         if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true'
         shell: bash
         env:
           AI_STOCK_DATA_CACHE_DIR: .cache/line-ai-stock-bot
         run: |
+          set -euo pipefail
           start_ts=$(date +%s)
-          python scripts/ai_stock_bot.py --branch-report --push-line
+          output="$(python scripts/ai_stock_bot.py --branch-report --push-line)"
+          printf '%s\n' "$output"
+          if printf '%s\n' "$output" | grep -q "尚未找到今日 20:00 主推播候選名單"; then
+            echo "has_entries=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_entries=true" >> "$GITHUB_OUTPUT"
+          fi
           end_ts=$(date +%s)
           elapsed=$((end_ts - start_ts))
           echo "AI_STOCK_REVIEW_WORKFLOW_RUNTIME elapsed_seconds=$elapsed"
 
       - name: Create AI review sent marker
-        if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true' && github.event_name == 'schedule'
+        if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true' && steps.review.outputs.has_entries == 'true'
         shell: bash
         run: |
           mkdir -p "$(dirname "${{ steps.taipei.outputs.sent_marker }}")"
@@ -119,7 +130,7 @@ jobs:
           } > "${{ steps.taipei.outputs.sent_marker }}"
 
       - name: Save AI review sent marker
-        if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true' && github.event_name == 'schedule'
+        if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true' && steps.review.outputs.has_entries == 'true'
         uses: actions/cache/save@v4
         continue-on-error: true
         with:
