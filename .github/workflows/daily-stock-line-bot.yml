@@ -187,9 +187,9 @@ jobs:
         if: steps.push-window.outputs.allowed == 'true'
         shell: bash
         run: |
-          if [ "${{ steps.taipei.outputs.should_mark_sent }}" = "true" ] && [ "${{ steps.sent-cache.outputs.cache-hit }}" = "true" ] && [ "${{ steps.taipei.outputs.force_fresh_push }}" != "true" ]; then
+          if [ "${{ steps.taipei.outputs.should_mark_sent }}" = "true" ] && [ "${{ steps.sent-cache.outputs.cache-hit }}" = "true" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "LINE stock bot already sent today via cache marker."
+            echo "LINE stock bot already sent today via cache marker; skip duplicate trigger."
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
