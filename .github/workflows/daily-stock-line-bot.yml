@@ -119,6 +119,7 @@ jobs:
       AI_STOCK_LINE_RADAR_DISPLAY_LIMIT: "3"
       AI_STOCK_LINE_EXIT_DISPLAY_LIMIT: "3"
       AI_STOCK_LINE_AI_REVIEW_DISPLAY_LIMIT: "3"
+      AI_STOCK_LINE_FLEX_CARD_LIMIT: "9"
       AI_STOCK_GEMINI_REVIEW_LIMIT: "3"
       AI_STOCK_ALLOW_INCOMPLETE_DATA_PUSH: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_latest_available_data == 'true' && 'true' || 'false' }}
       AI_STOCK_MIN_AVG_VOLUME_LOTS: "500"
@@ -130,6 +131,7 @@ jobs:
       AI_STOCK_FINMIND_MAX_REQUESTS: "450"
       AI_STOCK_TRACKER_MAX_PER_RUN: "30"
       AI_STOCK_MAX_RUNTIME_SEC: "3600"
+      AI_STOCK_FAIL_ON_ANALYSIS_ERROR: "true"
       AI_STOCK_MARGIN_RISK_RATIO: "0.20"
       LINE_BROADCAST: "false"
       DAILY_FINANCE_REPORT_URL: "https://wusftnt-bot.github.io/daily-finance-report/"

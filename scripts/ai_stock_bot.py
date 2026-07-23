@@ -51,6 +51,9 @@ DATA_CACHE_DIR = Path(os.getenv("AI_STOCK_DATA_CACHE_DIR", ".cache/line-ai-stock
 THEME_MAP_PATH = Path("data") / "industry_theme_map.csv"
 TAIPEI_TZ = timezone(timedelta(hours=8))
 LINE_TEXT_LIMIT = 5000
+LINE_FLEX_CAROUSEL_MAX_BUBBLES = 12
+LINE_FLEX_CAROUSEL_MAX_BYTES = 50 * 1024
+LINE_FLEX_ALT_TEXT_LIMIT = 1500
 DATA_SOURCE_STATUS = {
     "revenue": "unknown",
     "margins": "unknown",
@@ -142,6 +145,8 @@ RENAME_MAP = {
 KEEP_COLS = [
     "rank",
     "opportunity_rank",
+    "watch_rank",
+    "radar_rank",
     "stock_id",
     "stock_name",
     "candidate_source",
@@ -4243,6 +4248,8 @@ def build_v2_selection() -> tuple[list[StockRow], list[StockRow], list[StockRow]
 
 def build_markdown_report(top_stocks: list[StockRow], radar_stocks: list[StockRow]) -> str:
     taipei_now = datetime.now(TAIPEI_TZ)
+    top_display = top_stocks[:10]
+    radar_display = radar_stocks[:5]
     lines = [
         "# AI Stock Bot V2 Top 10",
         "",
@@ -4262,9 +4269,6 @@ def build_markdown_report(top_stocks: list[StockRow], radar_stocks: list[StockRo
             f"{row['gross_margin']:.1f}% | {row['operating_margin']:.1f}% | {row['net_margin']:.1f}% | "
             f"{row['close']:.2f} | {row['volume_ratio']:.2f}x | {shares_to_lots(row['foreign_5d_sum']):,.0f}張 | {shares_to_lots(row['trust_5d_sum']):,.0f}張 |"
         )
-        if len(watchlist_stocks) > len(watchlist_display):
-            lines.append(f"另有 {len(watchlist_stocks) - len(watchlist_display)} 檔 Watchlist 未顯示")
-
     if radar_display:
         lines.extend([
             "",
@@ -4929,11 +4933,499 @@ def build_line_message(
     return "\n".join(lines)
 
 
-def push_line_message(message: str) -> None:
+FLEX_BUCKET_STYLES = {
+    "top": {"label": "正式 Top", "color": "#166534", "soft": "#DCFCE7"},
+    "opportunity": {"label": "機會股", "color": "#1D4ED8", "soft": "#DBEAFE"},
+    "watchlist": {"label": "Watchlist", "color": "#475569", "soft": "#E2E8F0"},
+    "radar": {"label": "法人雷達", "color": "#B45309", "soft": "#FEF3C7"},
+}
+FLEX_GRADE_COLORS = {
+    "A": "#166534",
+    "B": "#1D4ED8",
+    "C": "#B45309",
+    "D": "#64748B",
+}
+
+
+def _flex_text(
+    text: Any,
+    *,
+    size: str = "sm",
+    color: str = "#334155",
+    weight: str | None = None,
+    wrap: bool = True,
+    flex: int | None = None,
+    align: str | None = None,
+    max_lines: int | None = None,
+) -> dict[str, Any]:
+    component: dict[str, Any] = {
+        "type": "text",
+        "text": str(text or ""),
+        "size": size,
+        "color": color,
+        "wrap": wrap,
+    }
+    if weight:
+        component["weight"] = weight
+    if flex is not None:
+        component["flex"] = flex
+    if align:
+        component["align"] = align
+    if max_lines is not None:
+        component["maxLines"] = max_lines
+    return component
+
+
+def _flex_stat(label: str, value: str) -> dict[str, Any]:
+    return {
+        "type": "box",
+        "layout": "vertical",
+        "flex": 1,
+        "spacing": "xs",
+        "contents": [
+            _flex_text(label, size="xxs", color="#64748B", align="center", wrap=False),
+            _flex_text(value, size="sm", color="#0F172A", weight="bold", align="center", wrap=False),
+        ],
+    }
+
+
+def _flex_signed_lots(value: Any) -> str:
+    lots = shares_to_lots(float(value or 0.0))
+    return f"{lots:+,.0f}張"
+
+
+def _flex_compact_reason(value: Any, default: str, limit: int = 2) -> str:
+    readable = _readable_reason_text(value, limit=limit)
+    return default if readable == "觀察" else readable
+
+
+def _flex_selection_reason(row: StockRow, bucket: str) -> str:
+    if bucket == "opportunity":
+        return _flex_compact_reason(row.get("opportunity_reason"), "法人與基本面同步改善")
+    if bucket == "watchlist":
+        return "分數具潛力，等待品質條件確認"
+    if bucket == "radar":
+        if row.get("quiet_accumulation"):
+            return "法人溫和布局，股價尚未過熱"
+        return "法人資金轉強，列入早期觀察"
+
+    reasons = []
+    if float(row.get("fundamental_score") or 0.0) >= 25:
+        reasons.append("基本面分數穩健")
+    institutional_5d = float(row.get("foreign_5d_sum") or 0.0) + float(row.get("trust_5d_sum") or 0.0)
+    if institutional_5d > 0:
+        reasons.append("法人5日淨買超")
+    if float(row.get("price_change_20d") or 0.0) < 15:
+        reasons.append("20日漲幅未過熱")
+    industry_grade = str(row.get("industry_capital_grade") or "")
+    if industry_grade in {"S", "A"}:
+        reasons.append(f"產業資金{industry_grade}級")
+    return "、".join(reasons[:2]) or "通過正式品質與風險門檻"
+
+
+def _flex_risk_reason(row: StockRow, bucket: str) -> str:
+    risk_values = [
+        row.get("event_risk_reason"),
+        row.get("risk_notes"),
+        row.get("top_quality_reason") if bucket == "watchlist" else "",
+    ]
+    labels = []
+    for value in risk_values:
+        if not value:
+            continue
+        readable = _readable_reason_text(value, limit=2)
+        if readable != "觀察":
+            labels.extend(part for part in readable.split("、") if part not in labels)
+    if float(row.get("price_change_20d") or 0.0) > 20 and "20日漲幅偏高" not in labels:
+        labels.append("20日漲幅偏高")
+    if float(row.get("volume_ratio") or 0.0) < 0.8 and "量能仍待確認" not in labels:
+        labels.append("量能仍待確認")
+    latest_institutional = float(row.get("latest_foreign_net") or 0.0) + float(row.get("latest_trust_net") or 0.0)
+    if latest_institutional < 0 and "法人當日轉賣" not in labels:
+        labels.append("法人當日轉賣")
+    return "、".join(labels[:2]) or "留意進場節奏與後續量價"
+
+
+def _flex_stock_rank(row: StockRow, bucket: str) -> str:
+    rank_key = {
+        "top": "rank",
+        "opportunity": "opportunity_rank",
+        "watchlist": "watch_rank",
+        "radar": "radar_rank",
+    }[bucket]
+    prefix = {"top": "", "opportunity": "O", "watchlist": "W", "radar": "R"}[bucket]
+    rank = int(float(row.get(rank_key) or 0))
+    return f"{prefix}{rank}" if rank else prefix or "-"
+
+
+def _select_flex_stock_rows(
+    top_stocks: list[StockRow],
+    opportunity_stocks: list[StockRow],
+    watchlist_stocks: list[StockRow],
+    radar_stocks: list[StockRow],
+) -> list[tuple[str, StockRow]]:
+    limit = max(1, min(env_int("AI_STOCK_LINE_FLEX_CARD_LIMIT", 9), LINE_FLEX_CAROUSEL_MAX_BUBBLES - 1))
+    sources = {
+        "top": top_stocks,
+        "opportunity": opportunity_stocks,
+        "watchlist": watchlist_stocks,
+        "radar": radar_stocks,
+    }
+    quotas = {"top": 5, "opportunity": 2, "watchlist": 1, "radar": 1}
+    selected: list[tuple[str, StockRow]] = []
+    selected_ids: set[str] = set()
+
+    def add(bucket: str, row: StockRow) -> None:
+        stock_id = str(row.get("stock_id") or "")
+        if not stock_id or stock_id in selected_ids or len(selected) >= limit:
+            return
+        selected.append((bucket, row))
+        selected_ids.add(stock_id)
+
+    for bucket in ("top", "opportunity", "watchlist", "radar"):
+        for row in sources[bucket][: quotas[bucket]]:
+            add(bucket, row)
+    if len(selected) < limit:
+        for bucket in ("top", "opportunity", "watchlist", "radar"):
+            for row in sources[bucket]:
+                add(bucket, row)
+    return selected
+
+
+def _flex_summary_bubble(
+    top_stocks: list[StockRow],
+    opportunity_stocks: list[StockRow],
+    watchlist_stocks: list[StockRow],
+    radar_stocks: list[StockRow],
+) -> dict[str, Any]:
+    investable = _status_value(DATA_SOURCE_STATUS.get("investable_universe", ""), "investable") or "0"
+    deep = _status_value(DATA_SOURCE_STATUS.get("preselection", ""), "deep") or "0"
+    audit = DATA_SOURCE_STATUS.get("candidate_audit", "unknown")
+    trade_date = format_trade_date(_status_value(audit, "trade_date") or "")
+    audit_state = _status_value(audit, "status") or "unknown"
+    audit_label = "正常" if audit_state == "normal" else "需檢查"
+    added = _status_value(audit, "added") or "0"
+    removed = _status_value(audit, "removed") or "0"
+    overlap = _status_value(audit, "overlap") or "0%"
+    market_summary = _readable_market_score(DATA_SOURCE_STATUS.get("market_score", "unknown"))
+    industry_summary = _readable_industry_capital_status(DATA_SOURCE_STATUS.get("industry_capital", "unknown"))
+    if len(industry_summary) > 110:
+        industry_summary = industry_summary[:107] + "..."
+    count_summary = (
+        f"Top {len(top_stocks)}  機會 {len(opportunity_stocks)}\n"
+        f"Watch {len(watchlist_stocks)}  雷達 {len(radar_stocks)}"
+    )
+    return {
+        "type": "bubble",
+        "size": "kilo",
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "backgroundColor": "#0F172A",
+            "paddingAll": "18px",
+            "spacing": "sm",
+            "contents": [
+                _flex_text("AI Stock Bot V2", size="xl", color="#FFFFFF", weight="bold"),
+                _flex_text(f"{trade_date or '今日'}｜三層候選池完成", size="sm", color="#CBD5E1"),
+            ],
+        },
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "paddingAll": "18px",
+            "spacing": "md",
+            "contents": [
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "spacing": "sm",
+                    "contents": [
+                        _flex_stat("可投資母體", f"{investable}檔"),
+                        _flex_stat("深度分析", f"{deep}檔"),
+                        _flex_stat("候選稽核", audit_label),
+                    ],
+                },
+                {"type": "separator", "color": "#E2E8F0"},
+                _flex_text(f"大盤｜{market_summary}", size="sm", color="#0F172A", weight="bold", max_lines=2),
+                _flex_text(
+                    f"候選｜新增 {added} / 退出 {removed} / 重複 {overlap}",
+                    size="sm",
+                    color="#334155",
+                ),
+                _flex_text(f"分層｜{count_summary}", size="sm", color="#334155"),
+                {
+                    "type": "box",
+                    "layout": "vertical",
+                    "backgroundColor": "#F8FAFC",
+                    "cornerRadius": "6px",
+                    "paddingAll": "10px",
+                    "contents": [
+                        _flex_text("法人資金產業", size="xs", color="#64748B", weight="bold"),
+                        _flex_text(industry_summary, size="xs", color="#334155", max_lines=4),
+                    ],
+                },
+            ],
+        },
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "paddingAll": "12px",
+            "contents": [
+                {
+                    "type": "button",
+                    "style": "primary",
+                    "height": "sm",
+                    "color": "#0F766E",
+                    "action": {
+                        "type": "uri",
+                        "label": "開啟完整財經看板",
+                        "uri": DAILY_FINANCE_REPORT_URL,
+                    },
+                }
+            ],
+        },
+    }
+
+
+def _flex_stock_bubble(bucket: str, row: StockRow) -> dict[str, Any]:
+    style = FLEX_BUCKET_STYLES[bucket]
+    grade = str(row.get("model_grade") or "D")
+    score = (
+        float(row.get("opportunity_score") or 0.0)
+        if bucket == "opportunity"
+        else float(row.get("accumulation_score") or 0.0)
+        if bucket == "radar"
+        else float(row.get("total_score") or 0.0)
+    )
+    score_label = "機會分" if bucket == "opportunity" else "雷達分" if bucket == "radar" else "總分"
+    institutional_days = 10 if bucket in {"opportunity", "radar"} else 5
+    institutional_net = (
+        float(row.get(f"foreign_{institutional_days}d_sum") or 0.0)
+        + float(row.get(f"trust_{institutional_days}d_sum") or 0.0)
+    )
+    theme = _readable_theme(row.get("industry_theme") or row.get("industry_category"))
+    industry_grade = str(row.get("industry_capital_grade") or "")
+    industry_label = f"{theme}｜產業資金 {industry_grade}" if industry_grade else theme
+    rank = _flex_stock_rank(row, bucket)
+    return {
+        "type": "bubble",
+        "size": "kilo",
+        "header": {
+            "type": "box",
+            "layout": "vertical",
+            "backgroundColor": style["color"],
+            "paddingAll": "16px",
+            "spacing": "sm",
+            "contents": [
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "alignItems": "center",
+                    "contents": [
+                        _flex_text(f"{rank}｜{row.get('stock_id')} {row.get('stock_name')}", size="lg", color="#FFFFFF", weight="bold", flex=1, max_lines=1),
+                        {
+                            "type": "box",
+                            "layout": "vertical",
+                            "backgroundColor": "#FFFFFF",
+                            "cornerRadius": "4px",
+                            "paddingAll": "5px",
+                            "contents": [
+                                _flex_text(
+                                    f"{grade}級",
+                                    size="xs",
+                                    color=FLEX_GRADE_COLORS.get(grade, "#475569"),
+                                    weight="bold",
+                                    align="center",
+                                    wrap=False,
+                                )
+                            ],
+                        },
+                    ],
+                },
+                _flex_text(f"{style['label']}｜{score_label} {score:.1f}", size="sm", color="#F8FAFC"),
+            ],
+        },
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "paddingAll": "16px",
+            "spacing": "md",
+            "contents": [
+                _flex_text(industry_label, size="sm", color="#0F172A", weight="bold", max_lines=1),
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "spacing": "sm",
+                    "contents": [
+                        _flex_stat("20日", f"{float(row.get('price_change_20d') or 0.0):+.1f}%"),
+                        _flex_stat("量比", f"{float(row.get('volume_ratio') or 0.0):.2f}x"),
+                        _flex_stat(f"法人{institutional_days}日", _flex_signed_lots(institutional_net)),
+                    ],
+                },
+                {
+                    "type": "box",
+                    "layout": "horizontal",
+                    "spacing": "md",
+                    "contents": [
+                        _flex_text(
+                            f"營收年增 {float(row.get('yoy') or 0.0):+.1f}%",
+                            size="xs",
+                            color="#475569",
+                            flex=1,
+                        ),
+                        _flex_text(
+                            f"估值 {float(row.get('valuation_score') or 0.0):.1f}/10",
+                            size="xs",
+                            color="#475569",
+                            flex=1,
+                            align="end",
+                        ),
+                    ],
+                },
+                {"type": "separator", "color": "#E2E8F0"},
+                {
+                    "type": "box",
+                    "layout": "vertical",
+                    "backgroundColor": style["soft"],
+                    "cornerRadius": "6px",
+                    "paddingAll": "9px",
+                    "spacing": "xs",
+                    "contents": [
+                        _flex_text("入選", size="xxs", color=style["color"], weight="bold"),
+                        _flex_text(_flex_selection_reason(row, bucket), size="xs", color="#0F172A", max_lines=2),
+                    ],
+                },
+                {
+                    "type": "box",
+                    "layout": "vertical",
+                    "spacing": "xs",
+                    "contents": [
+                        _flex_text("觀察風險", size="xxs", color="#B91C1C", weight="bold"),
+                        _flex_text(_flex_risk_reason(row, bucket), size="xs", color="#475569", max_lines=2),
+                    ],
+                },
+                _flex_text("資料觀察，不代表立即買進", size="xxs", color="#94A3B8", align="center"),
+            ],
+        },
+        "footer": {
+            "type": "box",
+            "layout": "vertical",
+            "paddingAll": "12px",
+            "contents": [
+                {
+                    "type": "button",
+                    "style": "link",
+                    "height": "sm",
+                    "color": style["color"],
+                    "action": {
+                        "type": "uri",
+                        "label": "完整分析",
+                        "uri": DAILY_FINANCE_REPORT_URL,
+                    },
+                }
+            ],
+        },
+    }
+
+
+def validate_line_flex_message(message: dict[str, Any]) -> tuple[int, int]:
+    if message.get("type") != "flex":
+        raise ValueError("LINE Flex message type must be 'flex'.")
+    alt_text = str(message.get("altText") or "")
+    if not alt_text or len(alt_text) > LINE_FLEX_ALT_TEXT_LIMIT:
+        raise ValueError(f"LINE Flex altText length invalid: {len(alt_text)}")
+    contents = message.get("contents") or {}
+    bubbles = contents.get("contents") if contents.get("type") == "carousel" else [contents]
+    bubble_count = len(bubbles or [])
+    if not 1 <= bubble_count <= LINE_FLEX_CAROUSEL_MAX_BUBBLES:
+        raise ValueError(f"LINE Flex bubble count invalid: {bubble_count}")
+    payload_bytes = len(json.dumps(contents, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    if payload_bytes > LINE_FLEX_CAROUSEL_MAX_BYTES:
+        raise ValueError(f"LINE Flex carousel exceeds 50 KB: {payload_bytes} bytes")
+    return bubble_count, payload_bytes
+
+
+def build_line_flex_message(
+    top_stocks: list[StockRow],
+    opportunity_stocks: list[StockRow],
+    watchlist_stocks: list[StockRow],
+    radar_stocks: list[StockRow],
+) -> dict[str, Any]:
+    stock_rows = _select_flex_stock_rows(
+        top_stocks,
+        opportunity_stocks,
+        watchlist_stocks,
+        radar_stocks,
+    )
+    bubbles = [
+        _flex_summary_bubble(top_stocks, opportunity_stocks, watchlist_stocks, radar_stocks),
+        *[_flex_stock_bubble(bucket, row) for bucket, row in stock_rows],
+    ]
+    trade_date = format_trade_date(
+        _status_value(DATA_SOURCE_STATUS.get("candidate_audit", ""), "trade_date") or ""
+    )
+    alt_text = (
+        f"AI Stock Bot V2｜{trade_date or '今日'}｜"
+        f"Top {len(top_stocks)}、機會 {len(opportunity_stocks)}、"
+        f"Watch {len(watchlist_stocks)}、雷達 {len(radar_stocks)}"
+    )
+    message = {
+        "type": "flex",
+        "altText": alt_text[:LINE_FLEX_ALT_TEXT_LIMIT],
+        "contents": {"type": "carousel", "contents": bubbles},
+    }
+    validate_line_flex_message(message)
+    return message
+
+
+def assert_three_layer_candidate_pipeline_ready() -> None:
+    investable = int(_status_value(DATA_SOURCE_STATUS.get("investable_universe", ""), "investable") or 0)
+    deep = int(_status_value(DATA_SOURCE_STATUS.get("preselection", ""), "deep") or 0)
+    target = int(_status_value(DATA_SOURCE_STATUS.get("preselection", ""), "target") or 0)
+    audit = DATA_SOURCE_STATUS.get("candidate_audit", "")
+    trade_date = _status_value(audit, "trade_date") or ""
+    warnings = set((_status_value(audit, "warnings") or "none").split(","))
+    expected_deep = min(target, investable) if target > 0 else investable
+    if investable <= 0:
+        raise RuntimeError("Three-layer candidate pipeline has no investable universe.")
+    if deep <= 0 or (expected_deep > 0 and deep < expected_deep):
+        raise RuntimeError(
+            f"Three-layer candidate pipeline incomplete: investable={investable} deep={deep} target={target}"
+        )
+    blocking_warnings = {
+        "pool_not_full",
+        "common_trade_date_not_advanced",
+        "common_trade_date_missing",
+    } & warnings
+    if blocking_warnings:
+        raise RuntimeError(
+            "Three-layer candidate pipeline audit failed: " + ",".join(sorted(blocking_warnings))
+        )
+    if not trade_date or trade_date == "missing":
+        raise RuntimeError("Three-layer candidate pipeline common trade date is missing.")
+    print(
+        "AI_STOCK_THREE_LAYER_READY "
+        f"investable={investable} deep={deep} target={target} trade_date={trade_date}"
+    )
+
+
+def push_line_message(message: str, rich_message: dict[str, Any] | None = None) -> None:
     message = ensure_finance_reference(message)
     if env_bool("LINE_TEST_PUSH") and not message.startswith("[TEST]"):
         message = f"[TEST] {message}"
     payload_text = trim_line_text(message)
+    line_message: dict[str, Any] = {"type": "text", "text": payload_text}
+    bubble_count = 0
+    rich_payload_bytes = 0
+    if rich_message is not None:
+        rich_message = json.loads(json.dumps(rich_message, ensure_ascii=False))
+        if env_bool("LINE_TEST_PUSH") and not str(rich_message.get("altText") or "").startswith("[TEST]"):
+            rich_message["altText"] = f"[TEST] {rich_message.get('altText', '')}"[:LINE_FLEX_ALT_TEXT_LIMIT]
+        try:
+            bubble_count, rich_payload_bytes = validate_line_flex_message(rich_message)
+            line_message = rich_message
+        except ValueError as error:
+            print(f"LINE_FLEX_FALLBACK reason={error}")
 
     channel_access_token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
     line_to = os.getenv("LINE_TO")
@@ -4943,16 +5435,20 @@ def push_line_message(message: str) -> None:
 
     if use_broadcast:
         endpoint = LINE_BROADCAST_URL
-        payload_obj = {"messages": [{"type": "text", "text": payload_text}]}
+        payload_obj = {"messages": [line_message]}
     else:
         if not line_to:
             raise ValueError("Missing LINE_TO. Use a LINE userId or groupId, or set LINE_BROADCAST=true.")
         endpoint = LINE_PUSH_URL
-        payload_obj = {"to": line_to, "messages": [{"type": "text", "text": payload_text}]}
+        payload_obj = {"to": line_to, "messages": [line_message]}
 
     print(
         "LINE_MESSAGE_CHECK "
-        f"finance_url={DAILY_FINANCE_REPORT_URL in payload_text} "
+        f"message_type={line_message.get('type')} "
+        f"request_message_objects=1 "
+        f"bubble_count={bubble_count} "
+        f"flex_bytes={rich_payload_bytes} "
+        f"finance_url={DAILY_FINANCE_REPORT_URL in json.dumps(line_message, ensure_ascii=False)} "
         f"test_push={payload_text.startswith('[TEST]')} "
         f"payload_length={len(payload_text)}"
     )
@@ -5829,14 +6325,22 @@ def main() -> None:
         return
 
     try:
+        flex_message: dict[str, Any] | None = None
         if push_enabled:
             assert_market_close_ready()
         top_stocks, opportunity_stocks, watchlist_stocks, radar_stocks, exit_alerts = build_v2_selection()
         if push_enabled:
             assert_data_completeness_ready()
+            assert_three_layer_candidate_pipeline_ready()
         write_strategy_tracker(top_stocks, opportunity_stocks, watchlist_stocks, radar_stocks, exit_alerts)
         attach_gemini_reviews(top_stocks, opportunity_stocks, watchlist_stocks, radar_stocks)
         message = build_line_message(top_stocks, opportunity_stocks, watchlist_stocks, radar_stocks, exit_alerts)
+        flex_message = build_line_flex_message(
+            top_stocks,
+            opportunity_stocks,
+            watchlist_stocks,
+            radar_stocks,
+        )
     except Exception as error:
         if not push_enabled:
             raise
@@ -5844,11 +6348,18 @@ def main() -> None:
             raise
         if is_pre_close_error(error):
             raise
+        if env_bool("AI_STOCK_FAIL_ON_ANALYSIS_ERROR", False):
+            print(
+                "AI_STOCK_ANALYSIS_FAILED_RETRYABLE "
+                f"error={type(error).__name__}:{readable_data_error(error)}"
+            )
+            raise
         top_stocks = []
         opportunity_stocks = []
         watchlist_stocks = []
         radar_stocks = []
         exit_alerts = []
+        flex_message = None
         message = build_data_unavailable_message(error)
     print(message)
     counts = {
@@ -5874,7 +6385,7 @@ def main() -> None:
         write_csv(REPORT_DIR / f"ai-stock-v2-exit-alerts-{today}.csv", exit_alerts)
 
     if push_enabled:
-        push_line_message(message)
+        push_line_message(message, flex_message)
     print_run_metrics("finished", started_at, started_perf, counts)
 
 
