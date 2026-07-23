@@ -3305,8 +3305,6 @@ def _readable_top_summary(rows: list[StockRow]) -> list[str]:
         f"產業輪動：{_readable_industry_momentum(DATA_SOURCE_STATUS.get('industry_momentum', 'unknown'))}",
         f"宏觀候選：{_readable_macro_theme_status(DATA_SOURCE_STATUS.get('macro_theme', 'unknown'))}",
         f"今日等級：A {a_count} / B {b_count} / C {c_count}",
-        f"Exit Alert：{_readable_exit_alert_status(DATA_SOURCE_STATUS.get('exit_alerts', 'unknown'))}",
-        f"追蹤紀錄：{_compact_tracker_status(DATA_SOURCE_STATUS.get('strategy_tracker', 'unknown'))}",
     ]
 
 
@@ -3352,7 +3350,7 @@ def build_line_message(
     radar_stocks: list[StockRow],
     exit_alerts: list[StockRow],
 ) -> str:
-    rows_for_grade = top_stocks or opportunity_stocks or watchlist_stocks or radar_stocks or exit_alerts
+    rows_for_grade = top_stocks or opportunity_stocks or watchlist_stocks or radar_stocks
     if not rows_for_grade:
         return "AI Stock Bot V2\n====================\n今日沒有股票通過篩選。"
 
@@ -3366,15 +3364,10 @@ def build_line_message(
     ]
     lines.extend(_readable_top_summary(rows_for_grade))
     lines.append("====================")
-    ai_review_lines = build_ai_review_lines(top_stocks, opportunity_stocks, watchlist_stocks, radar_stocks)
-    if ai_review_lines:
-        lines.extend(ai_review_lines)
-        lines.append("====================")
     top_display = top_stocks[: env_int("AI_STOCK_LINE_TOP_DISPLAY_LIMIT", 5)]
     opportunity_display = opportunity_stocks[: env_int("AI_STOCK_LINE_OPPORTUNITY_DISPLAY_LIMIT", 3)]
     watchlist_display = watchlist_stocks[: env_int("AI_STOCK_LINE_WATCH_DISPLAY_LIMIT", 3)]
     radar_display = radar_stocks[: env_int("AI_STOCK_LINE_RADAR_DISPLAY_LIMIT", 3)]
-    exit_display = exit_alerts[: env_int("AI_STOCK_LINE_EXIT_DISPLAY_LIMIT", 3)]
 
     lines.append("正式 Top：品質通過、C級以上、無主要風險扣分" if top_stocks else "正式 Top：今日沒有完全通過品質與風險條件的標的")
     for row in top_display:
@@ -3382,29 +3375,26 @@ def build_line_message(
         breakout = "創120日高" if row.get("break_120d_high") else "未創高"
         strong = " 三率三升" if row.get("triple_margin_up") else ""
         lines.extend([
-            f"{rank}. {row['stock_id']} {row['stock_name']}{strong}",
-            f"{row.get('model_grade', '')}級｜總分 {row['total_score']:.1f}｜基本 {row['fundamental_score']:.1f} 技術 {row['technical_score']:.1f} 籌碼 {row['chip_score']:.1f} 估值 {row.get('valuation_score', 0):.1f} 產業 {row.get('industry_score', 0):.1f} EPS加速 {row.get('eps_acceleration_score', 0):.1f} 宏觀 {row.get('macro_catalyst_score', 0):.1f}",
-            f"{_readable_market_meta(row)}｜營收 YoY {row['yoy']:.1f}% / 累計 {row['acc_yoy']:.1f}%｜1日 {row.get('price_change_1d', 0):.1f}%｜20日 {row['price_change_20d']:.1f}%｜量比 {row['volume_ratio']:.2f}x｜{breakout}｜{_readable_theme(row.get('industry_theme'))}",
-            f"外資5日 {shares_to_lots(row['foreign_5d_sum']):,.0f}張｜投信5日 {shares_to_lots(row['trust_5d_sum']):,.0f}張｜MA {row['ma5']:.1f}>{row['ma20']:.1f}>{row['ma60']:.1f}",
+            f"{rank}. {row['stock_id']} {row['stock_name']}{strong}｜{row.get('model_grade', '')} {row['total_score']:.1f}｜{_readable_theme(row.get('industry_theme'))}",
+            f"1日 {row.get('price_change_1d', 0):.1f}%｜20日 {row['price_change_20d']:.1f}%｜量比 {row['volume_ratio']:.2f}x｜外資/投信5日 {shares_to_lots(row['foreign_5d_sum']):,.0f}/{shares_to_lots(row['trust_5d_sum']):,.0f}張｜估 {row.get('valuation_score', 0):.1f} 產 {row.get('industry_score', 0):.1f} 宏 {row.get('macro_catalyst_score', 0):.1f}｜{breakout}",
         ])
 
     if len(top_stocks) > len(top_display):
         lines.append(f"另有 {len(top_stocks) - len(top_display)} 檔正式 Top 未顯示")
 
     if opportunity_display:
-        lines.extend(["====================", "機會股：法人早期建倉、基本面成長，仍需觀察風險與進場節奏"])
+        lines.extend(["====================", "機會股"])
         for row in opportunity_display:
             lines.extend([
-                f"O{row['opportunity_rank']} {row['stock_id']} {row['stock_name']}｜機會分 {row.get('opportunity_score', 0):.1f}｜{row.get('model_grade', '')}級 總分 {row['total_score']:.1f}",
-                f"理由：{row.get('opportunity_reason') or '法人/基本面早期訊號'}",
-                f"{_readable_theme(row.get('industry_theme'))}｜1日 {row.get('price_change_1d', 0):.1f}%｜20日 {row['price_change_20d']:.1f}%｜量比 {row['volume_ratio']:.2f}x｜外資10日 {shares_to_lots(row['foreign_10d_sum']):,.0f}張｜投信10日 {shares_to_lots(row['trust_10d_sum']):,.0f}張",
+                f"O{row['opportunity_rank']} {row['stock_id']} {row['stock_name']}｜機會 {row.get('opportunity_score', 0):.1f}｜總 {row['total_score']:.1f}｜{_readable_theme(row.get('industry_theme'))}",
+                f"1日 {row.get('price_change_1d', 0):.1f}%｜20日 {row['price_change_20d']:.1f}%｜量比 {row['volume_ratio']:.2f}x｜外資/投信10日 {shares_to_lots(row['foreign_10d_sum']):,.0f}/{shares_to_lots(row['trust_10d_sum']):,.0f}張",
             ])
 
         if len(opportunity_stocks) > len(opportunity_display):
             lines.append(f"另有 {len(opportunity_stocks) - len(opportunity_display)} 檔機會股未顯示")
 
     if watchlist_display:
-        lines.extend(["====================", "Watchlist：分數有潛力，但品質、風險或分散條件未達正式 Top"])
+        lines.extend(["====================", "Watchlist"])
         for row in watchlist_display:
             reason_values = [
                 row.get("top_quality_reason"),
@@ -3413,34 +3403,23 @@ def build_line_message(
             ]
             reason = "；".join(_readable_reason_text(item) for item in reason_values if item)
             lines.extend([
-                f"W{row['watch_rank']} {row['stock_id']} {row['stock_name']}｜{row.get('model_grade', '')}級｜總分 {row['total_score']:.1f}",
-                f"原因：{reason or '觀察'}",
-                f"1日 {row.get('price_change_1d', 0):.1f}%｜20日 {row['price_change_20d']:.1f}%｜{_readable_theme(row.get('industry_theme'))}｜外資5日 {shares_to_lots(row['foreign_5d_sum']):,.0f}張｜投信5日 {shares_to_lots(row['trust_5d_sum']):,.0f}張",
+                f"W{row['watch_rank']} {row['stock_id']} {row['stock_name']}｜總 {row['total_score']:.1f}｜{_readable_theme(row.get('industry_theme'))}",
+                f"1日 {row.get('price_change_1d', 0):.1f}%｜20日 {row['price_change_20d']:.1f}%｜外資/投信5日 {shares_to_lots(row['foreign_5d_sum']):,.0f}/{shares_to_lots(row['trust_5d_sum']):,.0f}張｜{reason or '觀察'}",
             ])
 
     if radar_display:
         lines.extend([
             "====================",
             "法人建倉雷達",
-            "條件：Top/機會股之外，最近法人未反手賣超、未重跌或跌停，且通過基本面底線。",
         ])
         for row in radar_display:
             quiet = "｜低調建倉" if row.get("quiet_accumulation") else "｜籌碼觀察"
             lines.extend([
                 f"R{row['radar_rank']} {row['stock_id']} {row['stock_name']}｜雷達 {row['accumulation_score']:.1f}{quiet}",
-                f"外資1日 {shares_to_lots(row.get('latest_foreign_net', 0)):,.0f}張｜投信1日 {shares_to_lots(row.get('latest_trust_net', 0)):,.0f}張｜近2日法人 {shares_to_lots(row.get('recent_2d_institutional_net', 0)):,.0f}張",
-                f"10日外資/投信 {shares_to_lots(row['foreign_10d_sum']):,.0f}/{shares_to_lots(row['trust_10d_sum']):,.0f}張｜占量 {row['institutional_20d_avg_volume_ratio'] * 100:.1f}%｜20日 {row['price_change_20d']:.1f}%｜量比 {row['volume_ratio']:.2f}x",
+                f"1日外資/投信 {shares_to_lots(row.get('latest_foreign_net', 0)):,.0f}/{shares_to_lots(row.get('latest_trust_net', 0)):,.0f}張｜近2日法人 {shares_to_lots(row.get('recent_2d_institutional_net', 0)):,.0f}張｜20日 {row['price_change_20d']:.1f}%｜量比 {row['volume_ratio']:.2f}x",
             ])
         if len(radar_stocks) > len(radar_display):
             lines.append(f"另有 {len(radar_stocks) - len(radar_display)} 檔法人建倉雷達未顯示")
-    if exit_display:
-        lines.extend(["====================", "Exit Alert 持股風險追蹤", "條件：曾列入追蹤名單，今日出現跌破均線、法人轉賣、重跌或營收轉弱。"])
-        for row in exit_display:
-            lines.extend([
-                f"E{row['exit_alert_rank']} {row['stock_id']} {row['stock_name']}｜來源 {row.get('exit_source', 'tracked')}",
-                f"風險：{_readable_reason_text(row.get('exit_alert_reasons'), limit=5)}",
-                f"1日 {row.get('price_change_1d', 0):.1f}%｜20日 {row.get('price_change_20d', 0):.1f}%｜MA20 {row.get('ma20', 0):.1f}｜近2日法人 {shares_to_lots(row.get('recent_2d_institutional_net', 0)):,.0f}張",
-            ])
     return "\n".join(lines)
 
 
