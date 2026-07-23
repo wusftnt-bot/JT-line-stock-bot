@@ -30,9 +30,14 @@ MOPS_BALANCE_SHEET_CSV_URL = "https://mopsfin.twse.com.tw/opendata/t187ap07_L_ci
 MOPS_BALANCE_SHEET_OTC_CSV_URL = "https://mopsfin.twse.com.tw/opendata/t187ap07_O_ci.csv"
 TWSE_INCOME_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap06_L_ci"
 TWSE_STOCK_DAY_URL = "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
+TWSE_ALL_MARKET_DAY_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
 TWSE_T86_URL = "https://www.twse.com.tw/rwd/zh/fund/T86"
 TWSE_MARGIN_URL = "https://www.twse.com.tw/rwd/zh/marginTrading/MI_MARGN"
 TWSE_ATTENTION_URL = "https://openapi.twse.com.tw/v1/announcement/notice"
+TPEX_ALL_MARKET_DAY_URL = "https://www.tpex.org.tw/www/zh-tw/afterTrading/dailyQuotes"
+TPEX_INSTITUTIONAL_CSV_URL = (
+    "https://www.tpex.org.tw/web/stock/3insti/daily_trade/3itrade_hedge_result.php"
+)
 TPEX_DISPOSAL_URL = "https://www.tpex.org.tw/openapi/v1/tpex_disposal_information"
 TPEX_ESB_DISPOSAL_URL = "https://www.tpex.org.tw/openapi/v1/tpex_esb_disposal_information"
 FINMIND_DATA_URL = "https://api.finmindtrade.com/api/v4/data"
@@ -66,6 +71,8 @@ DATA_SOURCE_STATUS = {
     "market_score": "unknown",
     "industry_momentum": "unknown",
     "industry_capital": "unknown",
+    "investable_universe": "unknown",
+    "preselection": "unknown",
     "macro_theme": "unknown",
     "exit_alerts": "unknown",
     "gemini_review": "disabled",
@@ -165,6 +172,10 @@ KEEP_COLS = [
     "previous_eps",
     "net_income",
     "equity",
+    "assets",
+    "liabilities",
+    "debt_ratio",
+    "financial_period",
     "roe",
     "pe_ratio",
     "pbr",
@@ -192,6 +203,9 @@ KEEP_COLS = [
     "prev_operating_margin",
     "prev_net_margin",
     "triple_margin_up",
+    "open",
+    "high",
+    "low",
     "close",
     "ma5",
     "ma20",
@@ -210,6 +224,8 @@ KEEP_COLS = [
     "break_20d_high",
     "break_60d_high",
     "break_120d_high",
+    "long_upper_wick",
+    "volume_price_divergence",
     "foreign_5d_sum",
     "foreign_5d_positive_days",
     "trust_5d_sum",
@@ -233,6 +249,23 @@ KEEP_COLS = [
     "industry_capital_reason",
     "industry_capital_ratio",
     "industry_capital_rank",
+    "fundamental_pre_score",
+    "fundamental_turn_score",
+    "early_capital_score",
+    "early_position_score",
+    "composite_pre_score",
+    "institutional_amount_ratio_1d",
+    "institutional_amount_ratio_5d",
+    "institutional_amount_ratio_10d",
+    "foreign_amount_ratio_10d",
+    "trust_amount_ratio_10d",
+    "dealer_amount_ratio_10d",
+    "distance_ma20_pct",
+    "entry_timing_pass",
+    "entry_timing_flags",
+    "fundamental_floor_pass",
+    "fundamental_floor_reason",
+    "candidate_sources",
     "radar_exclusion_reason",
     "institutional_20d_avg_volume_ratio",
     "foreign_prior_15d_sum",
@@ -304,6 +337,20 @@ def request_json(url: str, params: dict[str, str] | None = None, timeout: int = 
     request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def request_text(url: str, params: dict[str, str] | None = None, timeout: int = 60) -> str:
+    if params:
+        url = f"{url}?{urlencode(params)}"
+    request = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urlopen(request, timeout=timeout) as response:
+        raw = response.read()
+    for encoding in ("utf-8-sig", "utf-8", "cp950"):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", errors="replace")
 
 
 def fetch_with_retry(url: str, params: dict[str, str] | None = None, tries: int = 3, timeout: int = 60) -> Any:
@@ -836,11 +883,32 @@ def fetch_mops_financial_quality_map() -> dict[str, dict[str, float]]:
             continue
         net_income = clean_number(row_value_by_keywords(row, ["稅", "淨", "利"]))
         eps = clean_number(row_value_by_keywords(row, ["每股", "盈"]))
+        fiscal_year = str(
+            row_value_by_keywords(row, ["資料", "年度"])
+            or row_value_by_keywords(row, ["年度"])
+            or ""
+        ).strip()
+        fiscal_quarter = str(
+            row_value_by_keywords(row, ["季"])
+            or ""
+        ).strip()
+        financial_period = f"{fiscal_year}Q{fiscal_quarter}" if fiscal_year or fiscal_quarter else ""
         balance = balance_by_stock.get(stock_id, {})
         equity = clean_number(row_value_by_keywords(balance, ["權益", "總計"]))
+        assets = clean_number(row_value_by_keywords(balance, ["資產", "總計"]))
+        liabilities = clean_number(row_value_by_keywords(balance, ["負債", "總計"]))
+        debt_ratio = round(liabilities / assets * 100, 2) if assets > 0 else 0.0
         roe = round(net_income * 4 / equity * 100, 2) if equity > 0 else 0.0
         previous = previous_quality.get(stock_id, {}) if isinstance(previous_quality, dict) else {}
-        previous_eps = clean_number(previous.get("eps")) if isinstance(previous, dict) else 0.0
+        previous_period = str(previous.get("financial_period") or "") if isinstance(previous, dict) else ""
+        previous_eps = (
+            clean_number(previous.get("eps"))
+            if isinstance(previous, dict)
+            and previous_period
+            and financial_period
+            and previous_period != financial_period
+            else 0.0
+        )
         eps_change_pct = ((eps / previous_eps) - 1) * 100 if previous_eps > 0 and eps != previous_eps else 0.0
         quality[stock_id] = {
             "eps": eps,
@@ -849,6 +917,10 @@ def fetch_mops_financial_quality_map() -> dict[str, dict[str, float]]:
             "net_income": net_income,
             "equity": equity,
             "roe": roe,
+            "assets": assets,
+            "liabilities": liabilities,
+            "debt_ratio": debt_ratio,
+            "financial_period": financial_period,
         }
 
     DATA_SOURCE_STATUS["financial_quality"] = f"MOPS EPS/ROE rows={len(quality)}"
@@ -1092,15 +1164,17 @@ def summarize_industry_momentum(rows: list[StockRow]) -> None:
             continue
         price_20d = median([float(row.get("price_change_20d") or 0.0) for row in theme_rows])
         volume_ratio = median([float(row.get("volume_ratio") or 0.0) for row in theme_rows])
-        inst_10d = sum(float(row.get("institutional_10d_sum") or 0.0) for row in theme_rows)
+        inst_amount = sum(float(row.get("institutional_amount_10d") or 0.0) for row in theme_rows)
+        turnover_10d = sum(float(row.get("institutional_turnover_10d") or 0.0) for row in theme_rows)
+        capital_ratio = inst_amount / turnover_10d if turnover_10d > 0 else 0.0
         summaries.append(
             {
                 "theme": theme,
                 "count": len(theme_rows),
                 "price_20d": price_20d,
                 "volume_ratio": volume_ratio,
-                "inst_10d_lots": shares_to_lots(inst_10d),
-                "score": price_20d + volume_ratio * 3 + clip(shares_to_lots(inst_10d) / 10000, -5, 5),
+                "capital_ratio": capital_ratio,
+                "score": price_20d + volume_ratio * 3 + clip(capital_ratio * 100, -5, 5),
             }
         )
 
@@ -1110,7 +1184,7 @@ def summarize_industry_momentum(rows: list[StockRow]) -> None:
         DATA_SOURCE_STATUS["industry_momentum"] = "empty"
         return
     DATA_SOURCE_STATUS["industry_momentum"] = " | ".join(
-        f"{item['theme']}:{item['price_20d']:.1f}%/{item['volume_ratio']:.2f}x/{item['inst_10d_lots']:.0f}lots"
+        f"{item['theme']}:{item['price_20d']:.1f}%/{item['volume_ratio']:.2f}x/{item['capital_ratio'] * 100:.1f}capital"
         for item in top
     )
 
@@ -1367,7 +1441,7 @@ def evaluate_top_liquidity_quality(row: StockRow, include_model_score: bool = Tr
     max_volume_ratio = env_float("AI_STOCK_TOP_MAX_VOLUME_RATIO", 3.00)
     min_close = env_float("AI_STOCK_TOP_MIN_CLOSE", 10.0)
     max_1d_drop = env_float("AI_STOCK_TOP_MAX_1D_DROP", -4.0)
-    max_price_change = env_float("AI_STOCK_TOP_MAX_20D_PRICE_CHANGE", 35.0)
+    max_price_change = env_float("AI_STOCK_TOP_MAX_20D_PRICE_CHANGE", 25.0)
 
     volume_20d_avg = float(row.get("volume_20d_avg") or 0.0)
     latest_volume = float(row.get("latest_volume") or 0.0)
@@ -1397,6 +1471,10 @@ def evaluate_top_liquidity_quality(row: StockRow, include_model_score: bool = Tr
         reasons.append("heavy_1d_drop")
     if price_change_20d > max_price_change:
         reasons.append("overheated_20d_price")
+    if not bool(row.get("fundamental_floor_pass")):
+        reasons.append("fundamental_floor")
+    if not bool(row.get("entry_timing_pass")):
+        reasons.append("entry_timing_risk")
 
     return not reasons, ",".join(reasons)
 
@@ -1465,6 +1543,8 @@ def split_top_and_watchlist(rows: list[StockRow], top_limit: int) -> tuple[list[
         row
         for row in rows
         if row.get("top_quality_pass")
+        and row.get("fundamental_floor_pass")
+        and row.get("entry_timing_pass")
         and float(row.get("total_score") or 0.0) >= min_score
         and not row.get("risk_notes")
     ]
@@ -1734,7 +1814,7 @@ def apply_institutional_growth_model(rows: list[StockRow]) -> None:
         )
         grade = model_grade(total_score)
 
-        row["model_version"] = "V2.2 Institutional Growth + Macro Theme"
+        row["model_version"] = "V2.3 Multi-pool Early Rotation"
         row["legacy_score"] = round(legacy_score, 2)
         row["fundamental_score"] = round(fundamental_weighted, 2)
         row["chip_score"] = round(chip_weighted, 2)
@@ -1830,50 +1910,672 @@ def find_statement_values(items: list[dict[str, Any]], keywords: list[str]) -> l
     return []
 
 
-def select_fundamental_candidates(rows: list[StockRow], margins: dict[str, dict[str, float]]) -> list[StockRow]:
-    min_yoy = env_float("AI_STOCK_MIN_YOY", 20)
-    min_mom = env_float("AI_STOCK_MIN_MOM", 0)
-    min_acc_yoy = env_float("AI_STOCK_MIN_ACC_YOY", 15)
-    candidate_limit = env_int("AI_STOCK_CANDIDATE_LIMIT", 80)
+def calculate_fundamental_pre_score(row: StockRow) -> tuple[float, float, str]:
+    yoy = float(row.get("yoy") or 0.0)
+    mom = float(row.get("mom") or 0.0)
+    acc_yoy = float(row.get("acc_yoy") or 0.0)
+    eps = float(row.get("eps") or 0.0)
+    previous_eps = float(row.get("previous_eps") or 0.0)
+    eps_change = float(row.get("eps_change_pct") or 0.0)
+    roe = float(row.get("roe") or 0.0)
+    gross_margin = float(row.get("gross_margin") or 0.0)
+    operating_margin = float(row.get("operating_margin") or 0.0)
+    net_margin = float(row.get("net_margin") or 0.0)
+    debt_ratio = float(row.get("debt_ratio") or 0.0)
+    financial_available = any(
+        key in row for key in ("eps", "roe", "net_income", "equity")
+    )
 
-    selected = []
-    anomaly_count = 0
-    financial_count = 0
-    for row in rows:
-        industry = str(row.get("industry_category") or "")
-        if env_bool("AI_STOCK_EXCLUDE_FINANCIAL", True) and any(keyword in industry for keyword in ["金融", "證券", "保險"]):
-            financial_count += 1
+    revenue_score = (
+        clip((yoy + 10) / 60 * 8, 0, 8)
+        + clip((acc_yoy + 10) / 50 * 7, 0, 7)
+        + clip((mom + 10) / 40 * 3, 0, 3)
+        + (2 if yoy >= acc_yoy + 5 and yoy > 0 else 0)
+    )
+    quality_score = 0.0
+    notes: list[str] = []
+    if financial_available:
+        if eps > 0:
+            quality_score += 3
+        if previous_eps > 0 and eps_change >= 30:
+            quality_score += 4
+            notes.append("eps_accelerating")
+        elif previous_eps > 0 and eps_change <= -30:
+            quality_score -= 2
+            notes.append("eps_decelerating")
+        if roe >= 15:
+            quality_score += 4
+        elif roe >= 10:
+            quality_score += 2
+        if operating_margin > 0 and net_margin > 0:
+            quality_score += 2
+        if row.get("triple_margin_up"):
+            quality_score += 3
+            notes.append("margins_improving")
+        if debt_ratio:
+            quality_score += 2 if debt_ratio <= 50 else 1 if debt_ratio <= 65 else -1
+    else:
+        quality_score += 5
+        notes.append("financial_data_pending")
+
+    if gross_margin > 0 and operating_margin > 0:
+        quality_score += 1
+    score = round(clip(revenue_score + quality_score, 0, 40), 2)
+
+    turn_score = 0.0
+    if yoy > acc_yoy + 8 and yoy > 0:
+        turn_score += 5
+    if mom > 5 and yoy > 0:
+        turn_score += 3
+    if previous_eps > 0 and eps_change >= 30:
+        turn_score += 6
+    elif previous_eps <= 0 < eps:
+        turn_score += 7
+    if row.get("triple_margin_up"):
+        turn_score += 5
+    if operating_margin > float(row.get("prev_operating_margin") or 0.0) and operating_margin > 0:
+        turn_score += 3
+    return score, round(clip(turn_score, 0, 20), 2), ",".join(notes) or "available"
+
+
+def calculate_institutional_amount_metrics(
+    records: list[dict[str, float]],
+    price_records: list[StockRow],
+) -> dict[str, float]:
+    price_by_date = {
+        normalize_market_date(row.get("date")): row
+        for row in price_records
+        if normalize_market_date(row.get("date"))
+    }
+    recent = sorted(records, key=lambda item: item["date"], reverse=True)
+
+    def window(days: int) -> dict[str, float]:
+        foreign_amount = 0.0
+        trust_amount = 0.0
+        dealer_amount = 0.0
+        turnover = 0.0
+        positive_days = 0
+        used = 0
+        for item in recent[:days]:
+            date_key = normalize_market_date(item.get("trade_date") or item.get("date"))
+            price = price_by_date.get(date_key)
+            if not price:
+                continue
+            close = float(price.get("close") or 0.0)
+            day_turnover = float(price.get("turnover") or 0.0)
+            if close <= 0 or day_turnover <= 0:
+                continue
+            foreign_amount += float(item.get("foreign") or 0.0) * close
+            trust_amount += float(item.get("trust") or 0.0) * close
+            dealer_amount += float(item.get("dealer") or 0.0) * close
+            turnover += day_turnover
+            positive_days += int(
+                float(item.get("foreign") or 0.0)
+                + float(item.get("trust") or 0.0)
+                + float(item.get("dealer") or 0.0)
+                > 0
+            )
+            used += 1
+        total_amount = foreign_amount + trust_amount + dealer_amount
+        return {
+            "foreign_amount": foreign_amount,
+            "trust_amount": trust_amount,
+            "dealer_amount": dealer_amount,
+            "total_amount": total_amount,
+            "turnover": turnover,
+            "ratio": total_amount / turnover if turnover > 0 else 0.0,
+            "foreign_ratio": foreign_amount / turnover if turnover > 0 else 0.0,
+            "trust_ratio": trust_amount / turnover if turnover > 0 else 0.0,
+            "dealer_ratio": dealer_amount / turnover if turnover > 0 else 0.0,
+            "positive_days": float(positive_days),
+            "used_days": float(used),
+        }
+
+    one = window(1)
+    five = window(5)
+    ten = window(10)
+    score = (
+        clip(five["ratio"] / 0.08 * 10, -6, 10)
+        + clip(ten["trust_ratio"] / 0.03 * 5, -3, 5)
+        + clip(ten["foreign_ratio"] / 0.05 * 4, -3, 4)
+        + clip(ten["dealer_ratio"] / 0.02 * 2, -2, 2)
+        + clip(five["positive_days"] / max(five["used_days"], 1) * 3, 0, 3)
+        + (3 if five["ratio"] > ten["ratio"] > 0 else 0)
+        + (3 if one["ratio"] > 0 else -5 if one["ratio"] <= -0.08 else 0)
+    )
+    return {
+        "early_capital_score": round(clip(score, 0, 30), 2),
+        "institutional_amount_ratio_1d": one["ratio"],
+        "institutional_amount_ratio_5d": five["ratio"],
+        "institutional_amount_ratio_10d": ten["ratio"],
+        "foreign_amount_ratio_10d": ten["foreign_ratio"],
+        "trust_amount_ratio_10d": ten["trust_ratio"],
+        "dealer_amount_ratio_10d": ten["dealer_ratio"],
+        "institutional_amount_10d": ten["total_amount"],
+        "institutional_turnover_10d": ten["turnover"],
+        "institutional_positive_days_5d": five["positive_days"],
+        "institutional_amount_accelerating": five["ratio"] > ten["ratio"] > 0,
+        "latest_institutional_big_sell": one["ratio"] <= -0.08,
+    }
+
+
+def calculate_early_position_score(row: StockRow) -> tuple[float, bool, str]:
+    change_1d = float(row.get("price_change_1d") or 0.0)
+    change_20d = float(row.get("price_change_20d") or 0.0)
+    close = float(row.get("close") or 0.0)
+    ma20 = float(row.get("ma20") or 0.0)
+    ma60 = float(row.get("ma60") or 0.0)
+    volume_ratio = float(row.get("volume_ratio") or 0.0)
+    distance_ma20 = ((close / ma20) - 1) * 100 if ma20 > 0 else 99.0
+    flags: list[str] = []
+    score = 0.0
+
+    if -5 <= change_20d < 15:
+        score += 9
+    elif 15 <= change_20d <= 25:
+        score += 4
+    elif change_20d > 25:
+        flags.append("overheated_20d")
+    if -3 <= distance_ma20 <= 5:
+        score += 7
+    elif 5 < distance_ma20 <= 12:
+        score += 3
+    elif distance_ma20 > 12:
+        flags.append("far_above_ma20")
+    if 0.7 <= volume_ratio <= 1.8:
+        score += 6
+    elif 1.8 < volume_ratio <= 2.5:
+        score += 3
+    if ma20 > 0 and close >= ma20:
+        score += 3
+    if ma60 > 0 and close >= ma60:
+        score += 2
+    if row.get("break_60d_high") and change_20d <= 15:
+        score += 3
+    if change_1d > 7 and volume_ratio > 2.5:
+        flags.append("price_volume_overheat")
+    if change_1d <= -9:
+        flags.append("near_limit_down")
+    if row.get("long_upper_wick"):
+        flags.append("long_upper_wick")
+    if row.get("volume_price_divergence"):
+        flags.append("volume_price_divergence")
+    if row.get("latest_institutional_big_sell"):
+        flags.append("latest_institutional_big_sell")
+
+    hard_flags = {
+        "overheated_20d",
+        "far_above_ma20",
+        "price_volume_overheat",
+        "near_limit_down",
+        "long_upper_wick",
+        "volume_price_divergence",
+        "latest_institutional_big_sell",
+    }
+    timing_pass = not any(flag in hard_flags for flag in flags)
+    return round(clip(score, 0, 30), 2), timing_pass, ",".join(flags)
+
+
+def evaluate_fundamental_floor(row: StockRow) -> tuple[bool, str]:
+    reasons: list[str] = []
+    min_score = env_float("AI_STOCK_TOP_MIN_FUNDAMENTAL_PRE_SCORE", 16.0)
+    yoy = float(row.get("yoy") or 0.0)
+    acc_yoy = float(row.get("acc_yoy") or 0.0)
+    eps = float(row.get("eps") or 0.0)
+    if float(row.get("fundamental_pre_score") or 0.0) < min_score:
+        reasons.append("weak_fundamental_pre_score")
+    if max(yoy, acc_yoy) < env_float("AI_STOCK_TOP_MIN_REVENUE_GROWTH", -5.0):
+        reasons.append("revenue_growth_below_floor")
+    if eps < 0 and max(yoy, acc_yoy) < env_float("AI_STOCK_TOP_LOSS_HIGH_GROWTH_YOY", 40.0):
+        reasons.append("eps_loss_without_turnaround")
+    anomaly, anomaly_reason = detect_revenue_anomaly(row)
+    severe_reasons = [
+        item for item in anomaly_reason.split(",") if item and item != "small_current_revenue"
+    ]
+    if anomaly and severe_reasons:
+        reasons.append("revenue_anomaly")
+    return not reasons, ",".join(reasons)
+
+
+def build_investable_universe(
+    rows: list[StockRow],
+    margins: dict[str, dict[str, float]],
+    financial_quality: dict[str, dict[str, float]],
+    institutional: dict[str, list[dict[str, float]]],
+    event_risk_map: dict[str, StockRow],
+    price_history: dict[str, list[StockRow]],
+) -> list[StockRow]:
+    min_latest_volume = env_float("AI_STOCK_UNIVERSE_MIN_LATEST_VOLUME_LOTS", 100.0) * 1000
+    min_avg_volume = env_float("AI_STOCK_UNIVERSE_MIN_AVG_VOLUME_LOTS", 200.0) * 1000
+    min_turnover = env_float("AI_STOCK_UNIVERSE_MIN_TURNOVER_TWD", 20000000.0)
+    min_close = env_float("AI_STOCK_UNIVERSE_MIN_CLOSE", 10.0)
+    market_dates: dict[str, set[str]] = {}
+    for records in price_history.values():
+        for record in records:
+            market = str(record.get("market_type") or "")
+            date_key = normalize_market_date(record.get("date"))
+            if market and date_key:
+                market_dates.setdefault(market, set()).add(date_key)
+    recent_market_dates_by_type = {
+        market: sorted(dates, reverse=True)[:2]
+        for market, dates in market_dates.items()
+    }
+
+    rejected: Counter[str] = Counter()
+    investable: list[StockRow] = []
+    for source_row in rows:
+        stock_id = str(source_row.get("stock_id") or "")
+        if not re.fullmatch(r"\d{4}", stock_id):
+            rejected["not_common_stock"] += 1
             continue
-        anomaly, anomaly_reason = detect_revenue_anomaly(row)
-        row["revenue_anomaly"] = anomaly
-        row["revenue_anomaly_reason"] = anomaly_reason
-        if anomaly:
-            anomaly_count += 1
+        records = price_history.get(stock_id, [])
+        inst_records = institutional.get(stock_id, [])
+        if not inst_records:
+            rejected["missing_institutional"] += 1
             continue
-        if row["yoy"] <= min_yoy or row["mom"] <= min_mom or row["acc_yoy"] <= min_acc_yoy:
+        price_dates = {
+            normalize_market_date(item.get("date"))
+            for item in records
+            if normalize_market_date(item.get("date"))
+        }
+        institutional_dates = {
+            normalize_market_date(item.get("trade_date") or item.get("date"))
+            for item in inst_records
+            if normalize_market_date(item.get("trade_date") or item.get("date"))
+        }
+        common_dates = price_dates & institutional_dates
+        if not common_dates:
+            rejected["date_mismatch"] += 1
             continue
-        enriched = row.copy()
-        enriched.update(margins.get(row["stock_id"], {}))
-        enriched.setdefault("gross_margin", 0.0)
-        enriched.setdefault("operating_margin", 0.0)
-        enriched.setdefault("net_margin", 0.0)
-        enriched.setdefault("prev_gross_margin", 0.0)
-        enriched.setdefault("prev_operating_margin", 0.0)
-        enriched.setdefault("prev_net_margin", 0.0)
-        enriched.setdefault("triple_margin_up", False)
-        margin_score = (
-            clip(enriched["gross_margin"], 0, 50) * 0.16
-            + clip(enriched["operating_margin"], 0, 35) * 0.18
-            + clip(enriched["net_margin"], 0, 30) * 0.14
+        aligned_date = max(common_dates)
+        aligned_records = [
+            item
+            for item in records
+            if normalize_market_date(item.get("date")) <= aligned_date
+        ]
+        if len(aligned_records) < 60:
+            rejected["price_history_lt_60"] += 1
+            continue
+        market_type = str(
+            source_row.get("market_type")
+            or aligned_records[-1].get("market_type")
+            or ""
         )
-        revenue_score = calculate_revenue_score(enriched)
-        triple_margin_bonus = 8 if enriched["triple_margin_up"] else 0
-        enriched["fundamental_score"] = round(clip(revenue_score * 0.58 + margin_score + triple_margin_bonus, 0, 40), 2)
-        selected.append(enriched)
+        if aligned_date not in recent_market_dates_by_type.get(market_type, [aligned_date]):
+            rejected["stale_common_date"] += 1
+            continue
+        technical = calculate_technical_from_records(aligned_records)
+        event = event_risk_map.get(stock_id, {})
+        if event.get("event_risk_flags") or event.get("event_risk_level"):
+            rejected["event_risk"] += 1
+            continue
+        if float(technical.get("close") or 0.0) < min_close:
+            rejected["low_price"] += 1
+            continue
+        if float(technical.get("latest_volume") or 0.0) < min_latest_volume:
+            rejected["low_latest_volume"] += 1
+            continue
+        if float(technical.get("volume_20d_avg") or 0.0) < min_avg_volume:
+            rejected["low_avg_volume"] += 1
+            continue
+        if float(technical.get("turnover_20d_avg") or 0.0) < min_turnover:
+            rejected["low_turnover"] += 1
+            continue
 
-    selected.sort(key=lambda row: (row["fundamental_score"], row["yoy"], row["acc_yoy"]), reverse=True)
-    DATA_SOURCE_STATUS["revenue_filter"] = f"anomaly_removed={anomaly_count} financial_removed={financial_count}"
-    return selected[:candidate_limit]
+        enriched = enrich_revenue_candidate(source_row, margins)
+        enriched.update(financial_quality.get(stock_id, {}))
+        enriched.update(technical)
+        enriched.update(event)
+        enriched["industry_theme"] = classify_industry_theme(enriched)
+        enriched.update(calculate_institutional_amount_metrics(inst_records, aligned_records))
+        enriched["aligned_trade_date"] = aligned_date
+        fundamental_score, turn_score, fundamental_note = calculate_fundamental_pre_score(enriched)
+        enriched["fundamental_pre_score"] = fundamental_score
+        enriched["fundamental_turn_score"] = turn_score
+        enriched["fundamental_pre_note"] = fundamental_note
+        position_score, timing_pass, timing_flags = calculate_early_position_score(enriched)
+        enriched["early_position_score"] = position_score
+        enriched["entry_timing_pass"] = timing_pass
+        enriched["entry_timing_flags"] = timing_flags
+        enriched["distance_ma20_pct"] = round(
+            ((float(enriched["close"]) / float(enriched["ma20"])) - 1) * 100
+            if float(enriched.get("ma20") or 0.0) > 0
+            else 99.0,
+            2,
+        )
+        floor_pass, floor_reason = evaluate_fundamental_floor(enriched)
+        enriched["fundamental_floor_pass"] = floor_pass
+        enriched["fundamental_floor_reason"] = floor_reason
+        enriched["composite_pre_score"] = round(
+            fundamental_score
+            + float(enriched.get("early_capital_score") or 0.0)
+            + position_score,
+            2,
+        )
+        enriched["candidate_source"] = "investable_universe"
+        enriched["candidate_sources"] = []
+        investable.append(enriched)
+
+    DATA_SOURCE_STATUS["investable_universe"] = (
+        f"source={len(rows)} investable={len(investable)} "
+        + " ".join(f"{reason}={count}" for reason, count in rejected.most_common(6))
+    )
+    return investable
+
+
+def select_fundamental_growth_pool(rows: list[StockRow]) -> list[StockRow]:
+    limit = env_int("AI_STOCK_FUNDAMENTAL_GROWTH_LIMIT", 80)
+    candidates = [
+        row
+        for row in rows
+        if max(float(row.get("yoy") or 0.0), float(row.get("acc_yoy") or 0.0)) >= 10
+        and float(row.get("fundamental_pre_score") or 0.0) >= 16
+    ]
+    candidates.sort(
+        key=lambda row: (
+            float(row.get("fundamental_pre_score") or 0.0),
+            float(row.get("acc_yoy") or 0.0),
+            float(row.get("yoy") or 0.0),
+        ),
+        reverse=True,
+    )
+    return candidates[:limit]
+
+
+def select_fundamental_turn_pool(rows: list[StockRow]) -> list[StockRow]:
+    limit = env_int("AI_STOCK_FUNDAMENTAL_TURN_LIMIT", 40)
+    candidates = [
+        row
+        for row in rows
+        if float(row.get("fundamental_turn_score") or 0.0) >= 5
+        and max(float(row.get("yoy") or 0.0), float(row.get("acc_yoy") or 0.0)) >= 0
+    ]
+    candidates.sort(
+        key=lambda row: (
+            float(row.get("fundamental_turn_score") or 0.0),
+            float(row.get("fundamental_pre_score") or 0.0),
+            float(row.get("early_position_score") or 0.0),
+        ),
+        reverse=True,
+    )
+    return candidates[:limit]
+
+
+def select_early_institutional_pool(rows: list[StockRow]) -> list[StockRow]:
+    limit = env_int("AI_STOCK_EARLY_INSTITUTIONAL_LIMIT", 50)
+    candidates = [
+        row
+        for row in rows
+        if float(row.get("early_capital_score") or 0.0) >= 10
+        and float(row.get("institutional_amount_ratio_5d") or 0.0) > 0
+        and float(row.get("price_change_20d") or 0.0) < 15
+        and bool(row.get("entry_timing_pass"))
+    ]
+    candidates.sort(
+        key=lambda row: (
+            float(row.get("early_capital_score") or 0.0),
+            float(row.get("institutional_amount_ratio_5d") or 0.0),
+            float(row.get("fundamental_pre_score") or 0.0),
+        ),
+        reverse=True,
+    )
+    return candidates[:limit]
+
+
+def is_mainline_industry(row: StockRow) -> bool:
+    text = " ".join(
+        [
+            str(row.get("industry_theme") or ""),
+            str(row.get("industry_category") or ""),
+            str(row.get("industry_priority") or ""),
+        ]
+    ).lower()
+    return any(
+        keyword in text
+        for keyword in (
+            "ai",
+            "semiconductor",
+            "electronics",
+            "半導體",
+            "電子",
+            "記憶體",
+            "電腦",
+            "通信",
+            "光電",
+        )
+    )
+
+
+def build_industry_capital_stats(rows: list[StockRow]) -> dict[str, dict[str, Any]]:
+    market_5d = median([float(row.get("price_change_5d") or 0.0) for row in rows])
+    market_10d = median([float(row.get("price_change_10d") or 0.0) for row in rows])
+    market_20d = median([float(row.get("price_change_20d") or 0.0) for row in rows])
+    groups: dict[str, list[StockRow]] = {}
+    for row in rows:
+        industry = str(row.get("industry_theme") or row.get("industry_category") or "unknown")
+        groups.setdefault(industry, []).append(row)
+
+    stats: dict[str, dict[str, Any]] = {}
+    min_turnover = env_float("AI_STOCK_INDUSTRY_CAPITAL_MIN_TURNOVER_TWD", 300000000.0)
+    for industry, members in groups.items():
+        daily_turnover = sum(float(row.get("turnover_20d_avg") or 0.0) for row in members)
+        if daily_turnover < min_turnover:
+            continue
+        turnover_10d = sum(float(row.get("institutional_turnover_10d") or 0.0) for row in members)
+        inst_amount = sum(float(row.get("institutional_amount_10d") or 0.0) for row in members)
+        foreign_amount = sum(
+            float(row.get("foreign_amount_ratio_10d") or 0.0)
+            * float(row.get("institutional_turnover_10d") or 0.0)
+            for row in members
+        )
+        trust_amount = sum(
+            float(row.get("trust_amount_ratio_10d") or 0.0)
+            * float(row.get("institutional_turnover_10d") or 0.0)
+            for row in members
+        )
+        capital_ratio = inst_amount / turnover_10d if turnover_10d > 0 else 0.0
+        foreign_ratio = foreign_amount / turnover_10d if turnover_10d > 0 else 0.0
+        trust_ratio = trust_amount / turnover_10d if turnover_10d > 0 else 0.0
+        buy_count = sum(1 for row in members if float(row.get("institutional_amount_10d") or 0.0) > 0)
+        buy_ratio = buy_count / len(members) if members else 0.0
+        volume_ratio = median([float(row.get("volume_ratio") or 0.0) for row in members])
+        price_5d = median([float(row.get("price_change_5d") or 0.0) for row in members])
+        price_10d = median([float(row.get("price_change_10d") or 0.0) for row in members])
+        price_20d = median([float(row.get("price_change_20d") or 0.0) for row in members])
+        relative_strength = (
+            (price_5d - market_5d) * 0.4
+            + (price_10d - market_10d) * 0.3
+            + (price_20d - market_20d) * 0.3
+        )
+        non_overheated = 5.0 if price_20d <= 15 else 2.0 if price_20d <= 25 else 0.0
+        score = (
+            clip(capital_ratio / 0.12 * 30, 0, 30)
+            + clip(trust_ratio / 0.05 * 20, 0, 20)
+            + clip(foreign_ratio / 0.08 * 15, 0, 15)
+            + clip(buy_ratio * 10, 0, 10)
+            + clip(max(volume_ratio - 0.8, 0) / 0.8 * 10, 0, 10)
+            + clip((relative_strength + 5) / 15 * 10, 0, 10)
+            + non_overheated
+        )
+        stats[industry] = {
+            "industry": industry,
+            "score": round(score, 1),
+            "grade": industry_capital_grade(score),
+            "count": len(members),
+            "buy_count": buy_count,
+            "capital_ratio": capital_ratio,
+            "relative_strength": relative_strength,
+            "members": members,
+        }
+    return stats
+
+
+def select_industry_breakout_pool(
+    rows: list[StockRow],
+    industry_stats: dict[str, dict[str, Any]],
+) -> list[StockRow]:
+    if not env_bool("AI_STOCK_ENABLE_INDUSTRY_CAPITAL_CANDIDATES", True):
+        DATA_SOURCE_STATUS["industry_capital"] = "disabled"
+        return []
+    limit = env_int("AI_STOCK_INDUSTRY_CAPITAL_CANDIDATE_LIMIT", 30)
+    min_score = env_float("AI_STOCK_INDUSTRY_CAPITAL_MIN_SCORE", 60.0)
+    selected: list[StockRow] = []
+    for stat in sorted(industry_stats.values(), key=lambda item: item["score"], reverse=True):
+        if stat["score"] < min_score or stat["grade"] == "C" or stat["buy_count"] < 2:
+            continue
+        per_industry_limit = {"S": 5, "A": 3, "B": 2}.get(str(stat["grade"]), 0)
+        members = sorted(
+            stat["members"],
+            key=lambda row: (
+                float(row.get("early_capital_score") or 0.0),
+                float(row.get("fundamental_pre_score") or 0.0),
+                float(row.get("early_position_score") or 0.0),
+            ),
+            reverse=True,
+        )
+        picked = 0
+        for row in members:
+            if picked >= per_industry_limit or len(selected) >= limit:
+                break
+            if not row.get("entry_timing_pass"):
+                continue
+            if float(row.get("institutional_amount_ratio_5d") or 0.0) <= 0:
+                continue
+            if float(row.get("fundamental_pre_score") or 0.0) < 12:
+                continue
+            row["industry_capital_score"] = stat["score"]
+            row["industry_capital_grade"] = stat["grade"]
+            row["industry_capital_ratio"] = stat["capital_ratio"]
+            row["industry_capital_reason"] = (
+                f"{stat['grade']} capital={stat['capital_ratio'] * 100:.1f}% "
+                f"buy={stat['buy_count']}/{stat['count']} rs={stat['relative_strength']:.1f}"
+            )
+            selected.append(row)
+            picked += 1
+
+    top_industries = [
+        stat
+        for stat in sorted(industry_stats.values(), key=lambda item: item["score"], reverse=True)
+        if stat["score"] >= min_score and stat["grade"] != "C" and stat["buy_count"] >= 2
+    ][:3]
+    DATA_SOURCE_STATUS["industry_capital"] = (
+        " | ".join(
+            f"{item['industry']}:{item['grade']}{item['score']:.1f}/"
+            f"{item['capital_ratio'] * 100:.1f}%/{item['buy_count']}"
+            for item in top_industries
+        )
+        if top_industries
+        else "empty"
+    )
+    return selected[:limit]
+
+
+def select_non_mainstream_breakout_pool(
+    rows: list[StockRow],
+    industry_stats: dict[str, dict[str, Any]],
+) -> list[StockRow]:
+    limit = env_int("AI_STOCK_NON_MAINSTREAM_BREAKOUT_LIMIT", 20)
+    candidates: list[StockRow] = []
+    industry_counts: Counter[str] = Counter()
+    for row in sorted(
+        rows,
+        key=lambda item: (
+            float(
+                industry_stats.get(
+                    str(item.get("industry_theme") or item.get("industry_category") or "unknown"),
+                    {},
+                ).get("score", 0.0)
+            ),
+            float(item.get("composite_pre_score") or 0.0),
+        ),
+        reverse=True,
+    ):
+        if is_mainline_industry(row) or not row.get("entry_timing_pass"):
+            continue
+        industry = str(row.get("industry_theme") or row.get("industry_category") or "unknown")
+        stat = industry_stats.get(industry, {})
+        if float(stat.get("score") or 0.0) < 60 or str(stat.get("grade") or "C") == "C":
+            continue
+        if float(row.get("fundamental_pre_score") or 0.0) < 16:
+            continue
+        if float(row.get("early_capital_score") or 0.0) < 8:
+            continue
+        if float(row.get("price_change_20d") or 0.0) >= 20:
+            continue
+        if industry_counts[industry] >= 2:
+            continue
+        candidates.append(row)
+        industry_counts[industry] += 1
+        if len(candidates) >= limit:
+            break
+    DATA_SOURCE_STATUS["macro_theme"] = (
+        f"dynamic_non_mainstream candidates={len(candidates)} themes="
+        + ",".join(industry_counts.keys())
+    )
+    return candidates
+
+
+def merge_preselection_pools(
+    universe: list[StockRow],
+    growth: list[StockRow],
+    turns: list[StockRow],
+    institutional: list[StockRow],
+    industry: list[StockRow],
+    non_mainstream: list[StockRow],
+) -> list[StockRow]:
+    target = env_int("AI_STOCK_DEEP_ANALYSIS_LIMIT", 220)
+    selected: dict[str, StockRow] = {}
+    for pool, source in (
+        (growth, "fundamental_growth"),
+        (turns, "fundamental_turn"),
+        (institutional, "early_institutional"),
+        (industry, "industry_breakout"),
+        (non_mainstream, "non_mainstream_breakout"),
+    ):
+        for row in pool:
+            stock_id = str(row["stock_id"])
+            if stock_id not in selected:
+                selected[stock_id] = row
+            sources = selected[stock_id].setdefault("candidate_sources", [])
+            if source not in sources:
+                sources.append(source)
+
+    if len(selected) < target:
+        fallback = sorted(
+            (row for row in universe if str(row["stock_id"]) not in selected),
+            key=lambda row: (
+                float(row.get("composite_pre_score") or 0.0),
+                float(row.get("fundamental_pre_score") or 0.0),
+                float(row.get("early_capital_score") or 0.0),
+                -max(float(row.get("price_change_20d") or 0.0), 0.0),
+            ),
+            reverse=True,
+        )
+        for row in fallback:
+            row["candidate_sources"] = ["composite_fill"]
+            selected[str(row["stock_id"])] = row
+            if len(selected) >= target:
+                break
+
+    merged = sorted(
+        selected.values(),
+        key=lambda row: (
+            float(row.get("composite_pre_score") or 0.0),
+            float(row.get("fundamental_pre_score") or 0.0),
+            float(row.get("early_capital_score") or 0.0),
+        ),
+        reverse=True,
+    )[:target]
+    for row in merged:
+        row["candidate_source"] = ",".join(row.get("candidate_sources") or ["composite_fill"])
+    DATA_SOURCE_STATUS["candidate_pool"] = (
+        f"growth={len(growth)} turn={len(turns)} institutional={len(institutional)} "
+        f"industry={len(industry)} non_mainstream={len(non_mainstream)} merged={len(merged)}"
+    )
+    DATA_SOURCE_STATUS["preselection"] = (
+        f"universe={len(universe)} deep={len(merged)} target={target}"
+    )
+    return merged
 
 
 def enrich_revenue_candidate(row: StockRow, margins: dict[str, dict[str, float]]) -> StockRow:
@@ -2320,12 +3022,10 @@ def fetch_price_history(stock_id: str, months: int = 7) -> list[dict[str, float]
                 timeout=30,
             )
         except Exception:
-            continue
+            payload = {}
         fields = payload.get("fields", []) if isinstance(payload, dict) else []
         data = payload.get("data", []) if isinstance(payload, dict) else []
-        if not fields or not data:
-            continue
-        for values in data:
+        for values in data if fields else []:
             row = dict(zip(fields, values))
             trade_date = str(row.get("日期", ""))
             if not trade_date or trade_date in seen_dates:
@@ -2351,14 +3051,139 @@ def fetch_price_history(stock_id: str, months: int = 7) -> list[dict[str, float]
     return records
 
 
+def normalize_market_date(value: object) -> str:
+    digits = re.sub(r"\D", "", str(value or ""))
+    if len(digits) == 8:
+        return digits
+    if len(digits) == 7:
+        return f"{int(digits[:3]) + 1911:04d}{digits[3:]}"
+    return digits
+
+
+def _table_rows(payload: Any, required_field: str) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    tables = payload.get("tables", [])
+    for table in tables if isinstance(tables, list) else []:
+        fields = table.get("fields", []) if isinstance(table, dict) else []
+        data = table.get("data", []) if isinstance(table, dict) else []
+        if required_field in fields and isinstance(data, list):
+            return [dict(zip(fields, values)) for values in data if isinstance(values, list)]
+    return []
+
+
+def fetch_all_market_day(day: datetime.date) -> list[StockRow]:
+    date_key = day.strftime("%Y%m%d")
+    cached = read_cache(f"all_market_day_{date_key}")
+    if isinstance(cached, list) and cached:
+        return cached
+
+    normalized: list[StockRow] = []
+    try:
+        payload = fetch_with_retry(
+            TWSE_ALL_MARKET_DAY_URL,
+            params={"response": "json", "date": date_key, "type": "ALLBUT0999"},
+            tries=1,
+            timeout=25,
+        )
+        for row in _table_rows(payload, "證券代號"):
+            stock_id = str(row.get("證券代號") or "").strip()
+            if not re.fullmatch(r"\d{4}", stock_id):
+                continue
+            close = clean_number(row.get("收盤價"))
+            volume = clean_number(row.get("成交股數"))
+            turnover = clean_number(row.get("成交金額"))
+            if close <= 0 or volume <= 0 or turnover <= 0:
+                continue
+            normalized.append(
+                {
+                    "stock_id": stock_id,
+                    "market_type": "listed",
+                    "date": date_key,
+                    "open": clean_number(row.get("開盤價")),
+                    "high": clean_number(row.get("最高價")),
+                    "low": clean_number(row.get("最低價")),
+                    "close": close,
+                    "volume": volume,
+                    "turnover": turnover,
+                }
+            )
+    except Exception:
+        pass
+
+    try:
+        payload = fetch_with_retry(
+            TPEX_ALL_MARKET_DAY_URL,
+            params={"date": day.strftime("%Y/%m/%d"), "id": "", "response": "json"},
+            tries=1,
+            timeout=25,
+        )
+        for row in _table_rows(payload, "代號"):
+            stock_id = str(row.get("代號") or "").strip()
+            if not re.fullmatch(r"\d{4}", stock_id):
+                continue
+            close = clean_number(row.get("收盤"))
+            volume = clean_number(row.get("成交股數"))
+            turnover = clean_number(row.get("成交金額(元)"))
+            if close <= 0 or volume <= 0 or turnover <= 0:
+                continue
+            normalized.append(
+                {
+                    "stock_id": stock_id,
+                    "market_type": "otc",
+                    "date": date_key,
+                    "open": clean_number(row.get("開盤")),
+                    "high": clean_number(row.get("最高")),
+                    "low": clean_number(row.get("最低")),
+                    "close": close,
+                    "volume": volume,
+                    "turnover": turnover,
+                }
+            )
+    except Exception:
+        pass
+
+    if normalized:
+        write_cache(f"all_market_day_{date_key}", normalized)
+    return normalized
+
+
+def fetch_all_market_price_history(target_days: int = 65) -> dict[str, list[StockRow]]:
+    by_stock: dict[str, list[StockRow]] = {}
+    trading_days = 0
+    today = datetime.now(TAIPEI_TZ).date()
+    max_calendar_days = max(target_days * 2, 120)
+    for offset in range(max_calendar_days):
+        day = today - timedelta(days=offset)
+        if day.weekday() >= 5:
+            continue
+        daily_rows = fetch_all_market_day(day)
+        if not daily_rows:
+            continue
+        trading_days += 1
+        for row in daily_rows:
+            by_stock.setdefault(str(row["stock_id"]), []).append(row)
+        if trading_days >= target_days:
+            break
+        time.sleep(0.03)
+
+    for records in by_stock.values():
+        records.sort(key=lambda item: str(item.get("date") or ""))
+    DATA_SOURCE_STATUS["price"] = (
+        f"TWSE+TPEx bulk trading_days={trading_days} stocks={len(by_stock)}"
+        if by_stock
+        else "bulk_market_unavailable"
+    )
+    return by_stock
+
+
 def moving_average(values: list[float], window: int) -> float:
     if len(values) < window:
         return 0.0
     return sum(values[-window:]) / window
 
 
-def calculate_technical_score(stock_id: str) -> dict[str, Any]:
-    records = fetch_price_history(stock_id)
+def calculate_technical_from_records(records: list[StockRow]) -> dict[str, Any]:
     closes = [row["close"] for row in records]
     volumes = [row["volume"] for row in records]
     latest_trade_date = str(records[-1].get("date", "")) if records else ""
@@ -2382,6 +3207,8 @@ def calculate_technical_score(stock_id: str) -> dict[str, Any]:
             "break_20d_high": False,
             "break_60d_high": False,
             "break_120d_high": False,
+            "long_upper_wick": False,
+            "volume_price_divergence": False,
         }
 
     close = closes[-1]
@@ -2391,7 +3218,8 @@ def calculate_technical_score(stock_id: str) -> dict[str, Any]:
     volume20 = moving_average(volumes, 20)
     latest_volume = volumes[-1]
     volume_ratio = volumes[-1] / volume20 if volume20 else 0.0
-    turnover_20d_avg = close * volume20
+    turnover_values = [float(row.get("turnover") or 0.0) for row in records[-20:]]
+    turnover_20d_avg = sum(turnover_values) / len(turnover_values) if turnover_values else close * volume20
     price_change_1d = ((close / closes[-2]) - 1) * 100 if len(closes) >= 2 and closes[-2] else 0.0
     price_change_5d = ((close / closes[-6]) - 1) * 100 if len(closes) >= 6 and closes[-6] else 0.0
     price_change_10d = ((close / closes[-11]) - 1) * 100 if len(closes) >= 11 and closes[-11] else 0.0
@@ -2402,6 +3230,14 @@ def calculate_technical_score(stock_id: str) -> dict[str, Any]:
     break_20d_high = close > prior_high_20
     break_60d_high = close > prior_high_60
     break_120d_high = close > prior_high_120
+    latest = records[-1]
+    latest_open = float(latest.get("open") or close)
+    latest_high = float(latest.get("high") or max(latest_open, close))
+    latest_low = float(latest.get("low") or min(latest_open, close))
+    price_range = max(latest_high - latest_low, 0.0)
+    upper_wick = max(latest_high - max(latest_open, close), 0.0)
+    long_upper_wick = price_range > 0 and upper_wick / price_range >= 0.45 and volume_ratio >= 1.5
+    volume_price_divergence = volume_ratio >= 2.5 and price_change_1d <= 1.0
 
     score = 0.0
     if ma5 > ma20 > ma60:
@@ -2435,7 +3271,13 @@ def calculate_technical_score(stock_id: str) -> dict[str, Any]:
         "break_20d_high": break_20d_high,
         "break_60d_high": break_60d_high,
         "break_120d_high": break_120d_high,
+        "long_upper_wick": long_upper_wick,
+        "volume_price_divergence": volume_price_divergence,
     }
+
+
+def calculate_technical_score(stock_id: str) -> dict[str, Any]:
+    return calculate_technical_from_records(fetch_price_history(stock_id))
 
 
 def recent_market_dates(days: int = 12) -> list[str]:
@@ -2448,8 +3290,58 @@ def recent_market_dates(days: int = 12) -> list[str]:
     return dates
 
 
+def fetch_tpex_institutional_day(date_key: str) -> list[StockRow]:
+    cached = read_cache(f"tpex_institutional_{date_key}")
+    if isinstance(cached, list):
+        return cached
+
+    day = datetime.strptime(date_key, "%Y%m%d").date()
+    roc_date = f"{day.year - 1911:03d}/{day.month:02d}/{day.day:02d}"
+    try:
+        text = request_text(
+            TPEX_INSTITUTIONAL_CSV_URL,
+            params={"l": "zh-tw", "o": "csv", "se": "EW", "t": "D", "d": roc_date},
+            timeout=30,
+        )
+    except Exception:
+        return []
+
+    lines = [line for line in text.splitlines() if line.strip()]
+    header_index = next((index for index, line in enumerate(lines) if line.startswith("代號,")), -1)
+    if header_index < 0:
+        return []
+    title_match = re.search(r"(\d{3})年(\d{2})月(\d{2})日", lines[0])
+    actual_date_key = date_key
+    if title_match:
+        actual_date_key = (
+            f"{int(title_match.group(1)) + 1911:04d}"
+            f"{title_match.group(2)}{title_match.group(3)}"
+        )
+
+    rows: list[StockRow] = []
+    for row in csv.DictReader(io.StringIO("\n".join(lines[header_index:]))):
+        stock_id = str(row.get("代號") or "").strip()
+        if not re.fullmatch(r"\d{4}", stock_id):
+            continue
+        rows.append(
+            {
+                "stock_id": stock_id,
+                "date": float(actual_date_key),
+                "trade_date": actual_date_key,
+                "foreign": clean_number(row.get("外資及陸資(不含外資自營商)-買賣超股數")),
+                "trust": clean_number(row.get("投信-買賣超股數")),
+                "dealer": clean_number(row.get("自營商-買賣超股數")),
+            }
+        )
+    if rows:
+        write_cache(f"tpex_institutional_{date_key}", rows)
+    return rows
+
+
 def fetch_institutional_maps() -> dict[str, list[dict[str, float]]]:
     by_stock: dict[str, list[dict[str, float]]] = {}
+    listed_rows = 0
+    otc_rows = 0
     for date in recent_market_dates(35):
         try:
             payload = fetch_with_retry(
@@ -2490,8 +3382,37 @@ def fetch_institutional_maps() -> dict[str, list[dict[str, float]]]:
             by_stock.setdefault(stock_id, []).append(
                 {"date": float(date), "trade_date": date, "foreign": foreign, "trust": trust, "dealer": dealer}
             )
+            listed_rows += 1
+        for item in fetch_tpex_institutional_day(date):
+            stock_id = str(item.get("stock_id") or "")
+            if not stock_id:
+                continue
+            by_stock.setdefault(stock_id, []).append(
+                {
+                    "date": float(item["date"]),
+                    "trade_date": str(item["trade_date"]),
+                    "foreign": float(item["foreign"]),
+                    "trust": float(item["trust"]),
+                    "dealer": float(item["dealer"]),
+                }
+            )
+            otc_rows += 1
         if by_stock:
-            time.sleep(0.1)
+            time.sleep(0.05)
+    for stock_id, records in list(by_stock.items()):
+        deduplicated: dict[str, dict[str, float]] = {}
+        for item in records:
+            date_key = normalize_market_date(item.get("trade_date") or item.get("date"))
+            if date_key:
+                deduplicated[date_key] = item
+        by_stock[stock_id] = sorted(
+            deduplicated.values(),
+            key=lambda item: item["date"],
+            reverse=True,
+        )
+    DATA_SOURCE_STATUS["institutional"] = (
+        f"TWSE+TPEx listed_rows={listed_rows} otc_rows={otc_rows} stocks={len(by_stock)}"
+    )
     return by_stock
 
 
@@ -2974,29 +3895,37 @@ def build_v2_selection() -> tuple[list[StockRow], list[StockRow], list[StockRow]
     DATA_SOURCE_STATUS["pool"] = f"listed={listed_count} otc={otc_count} total={len(revenue_rows)}"
     margins = parse_income_margins()
     financial_quality = fetch_mops_financial_quality_map()
-    fundamental_candidates = select_fundamental_candidates(revenue_rows, margins)
     institutional = fetch_institutional_maps()
-    institutional_candidates = select_institutional_candidates(revenue_rows, margins, institutional, fundamental_candidates)
-    industry_capital_candidates = select_industry_capital_candidates(
+    event_risk_map = fetch_event_risk_map()
+    price_history = fetch_all_market_price_history(
+        env_int("AI_STOCK_UNIVERSE_HISTORY_DAYS", 65)
+    )
+    universe = build_investable_universe(
         revenue_rows,
         margins,
+        financial_quality,
         institutional,
-        fundamental_candidates + institutional_candidates,
+        event_risk_map,
+        price_history,
     )
-    macro_candidates = select_macro_theme_candidates(
-        revenue_rows,
-        margins,
-        institutional,
-        fundamental_candidates + institutional_candidates + industry_capital_candidates,
+    fundamental_growth = select_fundamental_growth_pool(universe)
+    fundamental_turns = select_fundamental_turn_pool(universe)
+    early_institutional = select_early_institutional_pool(universe)
+    industry_stats = build_industry_capital_stats(universe)
+    industry_breakouts = select_industry_breakout_pool(universe, industry_stats)
+    non_mainstream_breakouts = select_non_mainstream_breakout_pool(
+        universe,
+        industry_stats,
     )
-    candidates = merge_candidate_pools(
-        fundamental_candidates,
-        institutional_candidates,
-        industry_capital_candidates,
-        macro_candidates,
+    candidates = merge_preselection_pools(
+        universe,
+        fundamental_growth,
+        fundamental_turns,
+        early_institutional,
+        industry_breakouts,
+        non_mainstream_breakouts,
     )
     margin_map = fetch_margin_map()
-    event_risk_map = fetch_event_risk_map()
     top_limit = env_int("AI_STOCK_TOP_LIMIT", 10)
     finmind_fundamental_limit = env_int("AI_STOCK_FINMIND_FUNDAMENTAL_LIMIT", 25)
     finmind_valuation_count = 0
@@ -3014,7 +3943,13 @@ def build_v2_selection() -> tuple[list[StockRow], list[StockRow], list[StockRow]
             )
         )
         enriched.update(financial_quality.get(enriched["stock_id"], {}))
-        enriched.update(calculate_technical_score(enriched["stock_id"]))
+        if not enriched.get("latest_trade_date"):
+            records = price_history.get(enriched["stock_id"], [])
+            enriched.update(
+                calculate_technical_from_records(records)
+                if records
+                else calculate_technical_score(enriched["stock_id"])
+            )
         if index < finmind_fundamental_limit:
             try:
                 valuation_record = fetch_finmind_per_record(enriched["stock_id"])
@@ -3084,7 +4019,7 @@ def build_v2_selection() -> tuple[list[StockRow], list[StockRow], list[StockRow]
     apply_institutional_growth_model(results)
     summarize_top_quality(results)
     calculate_market_score(results)
-    summarize_industry_momentum(results)
+    summarize_industry_momentum(universe)
 
     results.sort(
         key=lambda row: (
@@ -3335,6 +4270,16 @@ REASON_LABELS = {
     "low_price": "股價過低",
     "heavy_1d_drop": "單日跌幅過重",
     "overheated_20d_price": "20日漲幅過熱",
+    "fundamental_floor": "基本面底線未通過",
+    "entry_timing_risk": "進場時機風險",
+    "weak_fundamental_pre_score": "基本面預分不足",
+    "revenue_growth_below_floor": "營收成長低於底線",
+    "eps_loss_without_turnaround": "虧損且未見明確轉機",
+    "far_above_ma20": "股價遠離月線",
+    "price_volume_overheat": "價量過熱",
+    "latest_institutional_big_sell": "法人最新大幅轉賣",
+    "long_upper_wick": "爆量長上影",
+    "volume_price_divergence": "爆量價滯",
     "yoy_over_300": "營收年增過熱",
     "small_revenue": "營收規模偏小",
     "margin_surge": "融資增幅偏高",
@@ -3443,11 +4388,17 @@ def _readable_quality_status(status: str) -> str:
 
 
 def _readable_candidate_pool(status: str) -> str:
-    fundamental = _status_value(status, "fundamental")
+    growth = _status_value(status, "growth")
+    turns = _status_value(status, "turn")
     institutional = _status_value(status, "institutional")
+    industry = _status_value(status, "industry")
+    non_mainstream = _status_value(status, "non_mainstream")
     merged = _status_value(status, "merged")
-    if fundamental and institutional and merged:
-        return f"基本面 {fundamental} 檔 / 法人建倉 {institutional} 檔 / 合併分析 {merged} 檔"
+    if growth and turns and institutional and industry and non_mainstream and merged:
+        return (
+            f"成長{growth} / 轉折{turns} / 法人{institutional} / "
+            f"產業{industry} / 非主流{non_mainstream} / 深算{merged}檔"
+        )
     return "候選池狀態未明"
 
 
@@ -3542,9 +4493,17 @@ def _readable_industry_momentum(status: str) -> str:
         values = metrics.split("/")
         price = values[0] if len(values) > 0 else ""
         volume = values[1] if len(values) > 1 else ""
-        lots = values[2].replace("lots", "張") if len(values) > 2 else ""
+        capital = values[2].replace("capital", "%") if len(values) > 2 else ""
         label = _readable_theme(theme)
-        summary = " / ".join(item for item in [f"20日{price}", f"量比{volume}" if volume else "", f"法人{lots}" if lots else ""] if item)
+        summary = " / ".join(
+            item
+            for item in [
+                f"20日{price}",
+                f"量比{volume}" if volume else "",
+                f"法人資金占比{capital}" if capital else "",
+            ]
+            if item
+        )
         items.append(f"{label}：{summary}")
     return "；".join(items) if items else "暫無明顯產業輪動"
 
@@ -3615,11 +4574,14 @@ def _readable_top_summary(rows: list[StockRow]) -> list[str]:
     a_count = sum(1 for row in rows if row.get("model_grade") == "A")
     b_count = sum(1 for row in rows if row.get("model_grade") == "B")
     c_count = sum(1 for row in rows if row.get("model_grade") == "C")
+    investable = _status_value(DATA_SOURCE_STATUS.get("investable_universe", ""), "investable") or "0"
+    deep = _status_value(DATA_SOURCE_STATUS.get("preselection", ""), "deep") or "0"
     return [
+        f"全市場篩選：可投資 {investable} 檔 / 深度分析 {deep} 檔",
         f"大盤濾網：{_readable_market_score(DATA_SOURCE_STATUS.get('market_score', 'unknown'))}",
         f"產業輪動：{_readable_industry_momentum(DATA_SOURCE_STATUS.get('industry_momentum', 'unknown'))}",
         f"法人資金產業：{_readable_industry_capital_status(DATA_SOURCE_STATUS.get('industry_capital', 'unknown'))}",
-        f"宏觀候選：{_readable_macro_theme_status(DATA_SOURCE_STATUS.get('macro_theme', 'unknown'))}",
+        f"非主流突破：{_readable_macro_theme_status(DATA_SOURCE_STATUS.get('macro_theme', 'unknown'))}",
         f"今日等級：A {a_count} / B {b_count} / C {c_count}",
     ]
 
