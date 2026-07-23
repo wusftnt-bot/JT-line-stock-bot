@@ -65,6 +65,7 @@ DATA_SOURCE_STATUS = {
     "strategy_tracker": "unknown",
     "market_score": "unknown",
     "industry_momentum": "unknown",
+    "industry_capital": "unknown",
     "macro_theme": "unknown",
     "exit_alerts": "unknown",
     "gemini_review": "disabled",
@@ -203,7 +204,11 @@ KEEP_COLS = [
     "institutional_trade_date",
     "margin_trade_date",
     "price_change_1d",
+    "price_change_5d",
+    "price_change_10d",
     "price_change_20d",
+    "break_20d_high",
+    "break_60d_high",
     "break_120d_high",
     "foreign_5d_sum",
     "foreign_5d_positive_days",
@@ -220,6 +225,14 @@ KEEP_COLS = [
     "recent_2d_institutional_net",
     "institutional_10d_sum",
     "institutional_20d_sum",
+    "dealer_5d_sum",
+    "dealer_10d_sum",
+    "latest_dealer_net",
+    "industry_capital_score",
+    "industry_capital_grade",
+    "industry_capital_reason",
+    "industry_capital_ratio",
+    "industry_capital_rank",
     "radar_exclusion_reason",
     "institutional_20d_avg_volume_ratio",
     "foreign_prior_15d_sum",
@@ -521,13 +534,15 @@ def fetch_finmind_institutional_records(stock_id: str, days: int = 45) -> list[d
         date = str(row.get("date", ""))
         if not date:
             continue
-        item = grouped.setdefault(date, {"date": float(date.replace("-", "")), "foreign": 0.0, "trust": 0.0})
+        item = grouped.setdefault(date, {"date": float(date.replace("-", "")), "foreign": 0.0, "trust": 0.0, "dealer": 0.0})
         net = clean_number(row.get("buy")) - clean_number(row.get("sell"))
         name = str(row.get("name", ""))
         if name in {"Foreign_Investor", "Foreign_Dealer_Self"}:
             item["foreign"] += net
         elif name == "Investment_Trust":
             item["trust"] += net
+        elif "Dealer" in name:
+            item["dealer"] += net
     return sorted(grouped.values(), key=lambda item: item["date"], reverse=True)
 
 
@@ -1890,10 +1905,11 @@ def institutional_candidate_score(stock_id: str, records: list[dict[str, float]]
         return 0.0, ""
     foreign_10 = sum(item["foreign"] for item in recent_10)
     trust_10 = sum(item["trust"] for item in recent_10)
-    inst_20 = sum(item["foreign"] + item["trust"] for item in recent_20)
+    dealer_10 = sum(item.get("dealer", 0.0) for item in recent_10)
+    inst_20 = sum(item["foreign"] + item["trust"] + item.get("dealer", 0.0) for item in recent_20)
     foreign_days = sum(1 for item in recent_10 if item["foreign"] > 0)
     trust_days = sum(1 for item in recent_10 if item["trust"] > 0)
-    prior_10 = sum(item["foreign"] + item["trust"] for item in latest[10:20])
+    prior_10 = sum(item["foreign"] + item["trust"] + item.get("dealer", 0.0) for item in latest[10:20])
     yoy = float(row.get("yoy") or 0.0)
     acc_yoy = float(row.get("acc_yoy") or 0.0)
 
@@ -1914,7 +1930,9 @@ def institutional_candidate_score(stock_id: str, records: list[dict[str, float]]
     if trust_days >= 5:
         score += 7
         reasons.append("投信買超天數多")
-    if prior_10 < 0 and foreign_10 + trust_10 > 0:
+    if dealer_10 > 0:
+        score += 3
+    if prior_10 < 0 and foreign_10 + trust_10 + dealer_10 > 0:
         score += 7
         reasons.append("法人由賣轉買")
     if inst_20 > 0:
@@ -2033,9 +2051,227 @@ def select_macro_theme_candidates(
     return selected
 
 
+def institutional_window_sums(records: list[dict[str, float]], days: int) -> dict[str, float]:
+    recent = sorted(records, key=lambda item: item["date"], reverse=True)[:days]
+    foreign = sum(float(item.get("foreign") or 0.0) for item in recent)
+    trust = sum(float(item.get("trust") or 0.0) for item in recent)
+    dealer = sum(float(item.get("dealer") or 0.0) for item in recent)
+    return {
+        "foreign": foreign,
+        "trust": trust,
+        "dealer": dealer,
+        "total": foreign + trust + dealer,
+        "positive_days": sum(
+            1
+            for item in recent
+            if float(item.get("foreign") or 0.0) + float(item.get("trust") or 0.0) + float(item.get("dealer") or 0.0) > 0
+        ),
+    }
+
+
+def industry_capital_grade(score: float) -> str:
+    if score >= 75:
+        return "S"
+    if score >= 65:
+        return "A"
+    if score >= 55:
+        return "B"
+    return "C"
+
+
+def select_industry_capital_candidates(
+    rows: list[StockRow],
+    margins: dict[str, dict[str, float]],
+    institutional: dict[str, list[dict[str, float]]],
+    existing: list[StockRow],
+) -> list[StockRow]:
+    if not env_bool("AI_STOCK_ENABLE_INDUSTRY_CAPITAL_CANDIDATES", True):
+        DATA_SOURCE_STATUS["industry_capital"] = "disabled"
+        return []
+
+    scan_limit = env_int("AI_STOCK_INDUSTRY_CAPITAL_SCAN_LIMIT", 220)
+    candidate_limit = env_int("AI_STOCK_INDUSTRY_CAPITAL_CANDIDATE_LIMIT", 30)
+    min_score = env_float("AI_STOCK_INDUSTRY_CAPITAL_MIN_SCORE", 60.0)
+    min_industry_turnover = env_float("AI_STOCK_INDUSTRY_CAPITAL_MIN_TURNOVER_TWD", 300000000.0)
+    min_latest_volume = env_float("AI_STOCK_INDUSTRY_CAPITAL_MIN_LATEST_VOLUME_LOTS", 300.0) * 1000
+    min_avg_volume = env_float("AI_STOCK_INDUSTRY_CAPITAL_MIN_AVG_VOLUME_LOTS", 500.0) * 1000
+    max_price_change_20d = env_float("AI_STOCK_INDUSTRY_CAPITAL_MAX_20D_PRICE_CHANGE", 30.0)
+    min_close = env_float("AI_STOCK_INDUSTRY_CAPITAL_MIN_CLOSE", 10.0)
+    min_revenue_growth = env_float("AI_STOCK_INDUSTRY_CAPITAL_MIN_REVENUE_GROWTH", -10.0)
+
+    existing_ids = {str(row.get("stock_id") or "") for row in existing}
+    preselected: list[tuple[float, StockRow]] = []
+    for row in rows:
+        stock_id = str(row.get("stock_id") or "")
+        if not stock_id or stock_id in existing_ids:
+            continue
+        records = institutional.get(stock_id, [])
+        if not records:
+            continue
+        one = institutional_window_sums(records, 1)
+        five = institutional_window_sums(records, 5)
+        ten = institutional_window_sums(records, 10)
+        if max(one["total"], five["total"], ten["total"]) <= 0:
+            continue
+        preliminary = max(one["total"] * 5, five["total"] * 2, ten["total"])
+        preselected.append((preliminary, row))
+
+    preselected.sort(key=lambda item: item[0], reverse=True)
+    scanned: list[StockRow] = []
+    for _score, row in preselected[:scan_limit]:
+        enriched = enrich_revenue_candidate(row, margins)
+        enriched["candidate_source"] = "industry_capital"
+        enriched["industry_theme"] = classify_industry_theme(enriched)
+        try:
+            enriched.update(calculate_technical_score(enriched["stock_id"]))
+        except Exception:
+            continue
+        records = institutional.get(enriched["stock_id"], [])
+        one = institutional_window_sums(records, 1)
+        five = institutional_window_sums(records, 5)
+        ten = institutional_window_sums(records, 10)
+        close = float(enriched.get("close") or 0.0)
+        turnover = float(enriched.get("turnover_20d_avg") or 0.0)
+        if close <= 0 or turnover <= 0:
+            continue
+        turnover_10d_estimate = turnover * 10
+        enriched["industry_capital_1d_amount"] = one["total"] * close
+        enriched["industry_capital_5d_amount"] = five["total"] * close
+        enriched["industry_capital_10d_amount"] = ten["total"] * close
+        enriched["industry_foreign_10d_amount"] = ten["foreign"] * close
+        enriched["industry_trust_10d_amount"] = ten["trust"] * close
+        enriched["industry_dealer_10d_amount"] = ten["dealer"] * close
+        enriched["industry_capital_ratio"] = ten["total"] * close / turnover_10d_estimate if turnover_10d_estimate > 0 else 0.0
+        enriched["industry_capital_positive"] = ten["total"] > 0
+        scanned.append(enriched)
+
+    if not scanned:
+        DATA_SOURCE_STATUS["industry_capital"] = "empty"
+        return []
+
+    market_5d = median([float(row.get("price_change_5d") or 0.0) for row in scanned])
+    market_10d = median([float(row.get("price_change_10d") or 0.0) for row in scanned])
+    market_20d = median([float(row.get("price_change_20d") or 0.0) for row in scanned])
+
+    by_industry: dict[str, list[StockRow]] = {}
+    for row in scanned:
+        industry = str(row.get("industry_theme") or row.get("industry_category") or "unknown")
+        by_industry.setdefault(industry, []).append(row)
+
+    industry_stats: dict[str, dict[str, Any]] = {}
+    for industry, industry_rows in by_industry.items():
+        turnover = sum(float(row.get("turnover_20d_avg") or 0.0) for row in industry_rows)
+        if turnover < min_industry_turnover:
+            continue
+        inst_10d_amount = sum(float(row.get("industry_capital_10d_amount") or 0.0) for row in industry_rows)
+        foreign_10d_amount = sum(float(row.get("industry_foreign_10d_amount") or 0.0) for row in industry_rows)
+        trust_10d_amount = sum(float(row.get("industry_trust_10d_amount") or 0.0) for row in industry_rows)
+        buy_count = sum(1 for row in industry_rows if float(row.get("industry_capital_10d_amount") or 0.0) > 0)
+        buy_ratio = buy_count / len(industry_rows) if industry_rows else 0.0
+        volume_ratio = median([float(row.get("volume_ratio") or 0.0) for row in industry_rows])
+        price_5d = median([float(row.get("price_change_5d") or 0.0) for row in industry_rows])
+        price_10d = median([float(row.get("price_change_10d") or 0.0) for row in industry_rows])
+        price_20d = median([float(row.get("price_change_20d") or 0.0) for row in industry_rows])
+        relative_strength = (price_5d - market_5d) * 0.4 + (price_10d - market_10d) * 0.3 + (price_20d - market_20d) * 0.3
+        turnover_10d_estimate = turnover * 10
+        capital_ratio = inst_10d_amount / turnover_10d_estimate if turnover_10d_estimate > 0 else 0.0
+        foreign_ratio = foreign_10d_amount / turnover_10d_estimate if turnover_10d_estimate > 0 else 0.0
+        trust_ratio = trust_10d_amount / turnover_10d_estimate if turnover_10d_estimate > 0 else 0.0
+        non_overheated = 5.0 if price_20d <= 15 else 2.0 if price_20d <= 25 else 0.0
+        score = (
+            clip(capital_ratio / 0.12 * 30, 0, 30)
+            + clip(trust_ratio / 0.05 * 20, 0, 20)
+            + clip(foreign_ratio / 0.08 * 15, 0, 15)
+            + clip(buy_ratio * 10, 0, 10)
+            + clip(max(volume_ratio - 0.8, 0) / 0.8 * 10, 0, 10)
+            + clip((relative_strength + 5) / 15 * 10, 0, 10)
+            + non_overheated
+        )
+        grade = industry_capital_grade(score)
+        industry_stats[industry] = {
+            "industry": industry,
+            "score": round(score, 1),
+            "grade": grade,
+            "count": len(industry_rows),
+            "buy_count": buy_count,
+            "capital_ratio": capital_ratio,
+            "foreign_ratio": foreign_ratio,
+            "trust_ratio": trust_ratio,
+            "volume_ratio": volume_ratio,
+            "price_5d": price_5d,
+            "price_10d": price_10d,
+            "price_20d": price_20d,
+            "relative_strength": relative_strength,
+        }
+
+    selected: list[StockRow] = []
+    for industry, stat in sorted(industry_stats.items(), key=lambda item: item[1]["score"], reverse=True):
+        if stat["score"] < min_score or stat["grade"] == "C" or stat["buy_count"] < 2:
+            continue
+        per_industry_limit = {"S": 5, "A": 3, "B": 2}.get(str(stat["grade"]), 0)
+        picked = 0
+        industry_rows = sorted(
+            by_industry.get(industry, []),
+            key=lambda row: (
+                float(row.get("industry_capital_ratio") or 0.0),
+                float(row.get("industry_capital_10d_amount") or 0.0),
+                -max(float(row.get("price_change_20d") or 0.0), 0.0),
+            ),
+            reverse=True,
+        )
+        for row in industry_rows:
+            if picked >= per_industry_limit or len(selected) >= candidate_limit:
+                break
+            latest_inst = institutional_window_sums(institutional.get(row["stock_id"], []), 1)["total"]
+            five_inst = institutional_window_sums(institutional.get(row["stock_id"], []), 5)["total"]
+            price_change_20d = float(row.get("price_change_20d") or 0.0)
+            close = float(row.get("close") or 0.0)
+            ma20 = float(row.get("ma20") or 0.0)
+            ma60 = float(row.get("ma60") or 0.0)
+            if latest_inst <= 0 and five_inst <= 0:
+                continue
+            if float(row.get("latest_volume") or 0.0) < min_latest_volume or float(row.get("volume_20d_avg") or 0.0) < min_avg_volume:
+                continue
+            if close < min_close or price_change_20d > max_price_change_20d:
+                continue
+            if ma20 > 0 and ma60 > 0 and close < ma20 and close < ma60 * 0.98:
+                continue
+            if max(float(row.get("yoy") or 0.0), float(row.get("acc_yoy") or 0.0)) < min_revenue_growth:
+                continue
+            stock_ratio = float(row.get("industry_capital_ratio") or 0.0)
+            early_score = 20 if price_change_20d < 15 else 10 if price_change_20d < 25 else 0
+            row["industry_capital_score"] = round(
+                clip(stat["score"] * 0.45 + clip(stock_ratio / 0.12 * 25, 0, 25) + early_score + min(max(float(row.get("volume_ratio") or 0.0), 0), 2) * 5, 0, 100),
+                1,
+            )
+            row["industry_capital_grade"] = stat["grade"]
+            row["industry_capital_reason"] = (
+                f"{stat['grade']} capital={stat['capital_ratio'] * 100:.1f}% "
+                f"buy={stat['buy_count']}/{stat['count']} rs={stat['relative_strength']:.1f}"
+            )
+            selected.append(row)
+            picked += 1
+
+    selected.sort(key=lambda row: float(row.get("industry_capital_score") or 0.0), reverse=True)
+    top_industries = [
+        item
+        for item in sorted(industry_stats.values(), key=lambda item: item["score"], reverse=True)
+        if item["score"] >= min_score and item["grade"] != "C" and item["buy_count"] >= 2
+    ][:3]
+    if top_industries:
+        DATA_SOURCE_STATUS["industry_capital"] = " | ".join(
+            f"{item['industry']}:{item['grade']}{item['score']:.1f}/{item['capital_ratio'] * 100:.1f}%/{item['buy_count']}"
+            for item in top_industries
+        )
+    else:
+        DATA_SOURCE_STATUS["industry_capital"] = "empty"
+    return selected[:candidate_limit]
+
+
 def merge_candidate_pools(
     fundamental: list[StockRow],
     institutional_candidates: list[StockRow],
+    industry_capital_candidates: list[StockRow] | None = None,
     macro_candidates: list[StockRow] | None = None,
 ) -> list[StockRow]:
     merged: list[StockRow] = []
@@ -2044,6 +2280,7 @@ def merge_candidate_pools(
     for pool, default_source in [
         (fundamental, "fundamental"),
         (institutional_candidates, "institutional"),
+        (industry_capital_candidates or [], "industry_capital"),
         (macro_candidates or [], "macro_theme"),
     ]:
         for row in pool:
@@ -2055,7 +2292,7 @@ def merge_candidate_pools(
 
     DATA_SOURCE_STATUS["candidate_pool"] = (
         f"fundamental={len(fundamental)} institutional={len(institutional_candidates)} "
-        f"macro={len(macro_candidates or [])} merged={len(merged)}"
+        f"industry_capital={len(industry_capital_candidates or [])} macro={len(macro_candidates or [])} merged={len(merged)}"
     )
     return merged
 
@@ -2139,7 +2376,11 @@ def calculate_technical_score(stock_id: str) -> dict[str, Any]:
             "turnover_20d_avg": 0.0,
             "latest_trade_date": latest_trade_date,
             "price_change_1d": round(price_change_1d, 2),
+            "price_change_5d": 0.0,
+            "price_change_10d": 0.0,
             "price_change_20d": 0.0,
+            "break_20d_high": False,
+            "break_60d_high": False,
             "break_120d_high": False,
         }
 
@@ -2152,8 +2393,14 @@ def calculate_technical_score(stock_id: str) -> dict[str, Any]:
     volume_ratio = volumes[-1] / volume20 if volume20 else 0.0
     turnover_20d_avg = close * volume20
     price_change_1d = ((close / closes[-2]) - 1) * 100 if len(closes) >= 2 and closes[-2] else 0.0
+    price_change_5d = ((close / closes[-6]) - 1) * 100 if len(closes) >= 6 and closes[-6] else 0.0
+    price_change_10d = ((close / closes[-11]) - 1) * 100 if len(closes) >= 11 and closes[-11] else 0.0
     price_change_20d = ((close / closes[-21]) - 1) * 100 if len(closes) >= 21 and closes[-21] else 0.0
+    prior_high_20 = max(closes[-21:-1]) if len(closes) >= 21 else max(closes[:-1])
+    prior_high_60 = max(closes[-61:-1]) if len(closes) >= 61 else max(closes[:-1])
     prior_high_120 = max(closes[-121:-1]) if len(closes) >= 121 else max(closes[:-1])
+    break_20d_high = close > prior_high_20
+    break_60d_high = close > prior_high_60
     break_120d_high = close > prior_high_120
 
     score = 0.0
@@ -2182,7 +2429,11 @@ def calculate_technical_score(stock_id: str) -> dict[str, Any]:
         "turnover_20d_avg": round(turnover_20d_avg, 0),
         "latest_trade_date": latest_trade_date,
         "price_change_1d": round(price_change_1d, 2),
+        "price_change_5d": round(price_change_5d, 2),
+        "price_change_10d": round(price_change_10d, 2),
         "price_change_20d": round(price_change_20d, 2),
+        "break_20d_high": break_20d_high,
+        "break_60d_high": break_60d_high,
         "break_120d_high": break_120d_high,
     }
 
@@ -2228,7 +2479,17 @@ def fetch_institutional_maps() -> dict[str, list[dict[str, float]]]:
                 ],
             )
             trust = pick_exact_number(row, ["投信買賣超股數"])
-            by_stock.setdefault(stock_id, []).append({"date": float(date), "trade_date": date, "foreign": foreign, "trust": trust})
+            dealer = pick_exact_number(
+                row,
+                [
+                    "自營商買賣超股數",
+                    "自營商買賣超股數(自行買賣)",
+                    "自營商買賣超股數(避險)",
+                ],
+            )
+            by_stock.setdefault(stock_id, []).append(
+                {"date": float(date), "trade_date": date, "foreign": foreign, "trust": trust, "dealer": dealer}
+            )
         if by_stock:
             time.sleep(0.1)
     return by_stock
@@ -2367,18 +2628,28 @@ def calculate_accumulation_score(
     all_records = sorted(institutional.get(row["stock_id"], []), key=lambda item: item["date"], reverse=True)
     records = all_records[:10]
     records_20d = all_records[:20]
+    records_5d = all_records[:5]
     foreign_values = [item["foreign"] for item in records]
     trust_values = [item["trust"] for item in records]
+    dealer_values = [item.get("dealer", 0.0) for item in records]
+    dealer_5d_values = [item.get("dealer", 0.0) for item in records_5d]
     foreign_20d_values = [item["foreign"] for item in records_20d]
     trust_20d_values = [item["trust"] for item in records_20d]
+    dealer_20d_values = [item.get("dealer", 0.0) for item in records_20d]
     foreign_sum = sum(foreign_values)
     trust_sum = sum(trust_values)
-    institutional_sum = foreign_sum + trust_sum
-    institutional_20d_sum = sum(foreign_20d_values) + sum(trust_20d_values)
+    dealer_sum = sum(dealer_values)
+    institutional_sum = foreign_sum + trust_sum + dealer_sum
+    institutional_20d_sum = sum(foreign_20d_values) + sum(trust_20d_values) + sum(dealer_20d_values)
     latest_foreign_net = foreign_values[0] if foreign_values else 0.0
     latest_trust_net = trust_values[0] if trust_values else 0.0
-    latest_institutional_net = latest_foreign_net + latest_trust_net
-    prior_institutional_net = (foreign_values[1] + trust_values[1]) if len(foreign_values) >= 2 and len(trust_values) >= 2 else 0.0
+    latest_dealer_net = dealer_values[0] if dealer_values else 0.0
+    latest_institutional_net = latest_foreign_net + latest_trust_net + latest_dealer_net
+    prior_institutional_net = (
+        foreign_values[1] + trust_values[1] + dealer_values[1]
+        if len(foreign_values) >= 2 and len(trust_values) >= 2 and len(dealer_values) >= 2
+        else 0.0
+    )
     recent_2d_institutional_net = latest_institutional_net + prior_institutional_net
     foreign_prior_15d_sum = sum(foreign_20d_values[5:20])
     foreign_positive_days = sum(1 for value in foreign_values if value > 0)
@@ -2445,8 +2716,11 @@ def calculate_accumulation_score(
         "foreign_10d_positive_days": foreign_positive_days,
         "trust_10d_sum": round(trust_sum, 0),
         "trust_10d_positive_days": trust_positive_days,
+        "dealer_5d_sum": round(sum(dealer_5d_values), 0),
+        "dealer_10d_sum": round(dealer_sum, 0),
         "latest_foreign_net": round(latest_foreign_net, 0),
         "latest_trust_net": round(latest_trust_net, 0),
+        "latest_dealer_net": round(latest_dealer_net, 0),
         "latest_institutional_net": round(latest_institutional_net, 0),
         "prior_institutional_net": round(prior_institutional_net, 0),
         "recent_2d_institutional_net": round(recent_2d_institutional_net, 0),
@@ -2703,13 +2977,24 @@ def build_v2_selection() -> tuple[list[StockRow], list[StockRow], list[StockRow]
     fundamental_candidates = select_fundamental_candidates(revenue_rows, margins)
     institutional = fetch_institutional_maps()
     institutional_candidates = select_institutional_candidates(revenue_rows, margins, institutional, fundamental_candidates)
-    macro_candidates = select_macro_theme_candidates(
+    industry_capital_candidates = select_industry_capital_candidates(
         revenue_rows,
         margins,
         institutional,
         fundamental_candidates + institutional_candidates,
     )
-    candidates = merge_candidate_pools(fundamental_candidates, institutional_candidates, macro_candidates)
+    macro_candidates = select_macro_theme_candidates(
+        revenue_rows,
+        margins,
+        institutional,
+        fundamental_candidates + institutional_candidates + industry_capital_candidates,
+    )
+    candidates = merge_candidate_pools(
+        fundamental_candidates,
+        institutional_candidates,
+        industry_capital_candidates,
+        macro_candidates,
+    )
     margin_map = fetch_margin_map()
     event_risk_map = fetch_event_risk_map()
     top_limit = env_int("AI_STOCK_TOP_LIMIT", 10)
@@ -3282,6 +3567,36 @@ def _readable_macro_theme_status(status: str) -> str:
     return text
 
 
+def _readable_industry_capital_status(status: str) -> str:
+    text = str(status or "")
+    if not text or text in {"unknown", "empty"}:
+        return "暫無明顯法人資金突破產業"
+    if text == "disabled":
+        return "未啟用"
+    items = []
+    for part in text.split(" | "):
+        if ":" not in part:
+            continue
+        industry, metrics = part.split(":", 1)
+        values = metrics.split("/")
+        grade_score = values[0] if len(values) > 0 else ""
+        capital_ratio = values[1] if len(values) > 1 else ""
+        buy_count = values[2] if len(values) > 2 else ""
+        label = _readable_theme(industry)
+        detail = " / ".join(
+            item
+            for item in [
+                grade_score,
+                f"資金占比{capital_ratio}" if capital_ratio else "",
+                f"買超{buy_count}檔" if buy_count else "",
+            ]
+            if item
+        )
+        if detail:
+            items.append(f"{label}：{detail}")
+    return "；".join(items) if items else text
+
+
 def _readable_exit_alert_status(status: str) -> str:
     text = str(status or "")
     if not text or text in {"unknown", "empty"}:
@@ -3303,6 +3618,7 @@ def _readable_top_summary(rows: list[StockRow]) -> list[str]:
     return [
         f"大盤濾網：{_readable_market_score(DATA_SOURCE_STATUS.get('market_score', 'unknown'))}",
         f"產業輪動：{_readable_industry_momentum(DATA_SOURCE_STATUS.get('industry_momentum', 'unknown'))}",
+        f"法人資金產業：{_readable_industry_capital_status(DATA_SOURCE_STATUS.get('industry_capital', 'unknown'))}",
         f"宏觀候選：{_readable_macro_theme_status(DATA_SOURCE_STATUS.get('macro_theme', 'unknown'))}",
         f"今日等級：A {a_count} / B {b_count} / C {c_count}",
     ]
@@ -3488,6 +3804,10 @@ def compact_for_gemini(row: StockRow, bucket: str) -> dict[str, Any]:
         "macro_catalyst_score": row.get("macro_catalyst_score"),
         "macro_catalyst_note": row.get("macro_catalyst_note"),
         "macro_context": row.get("macro_context"),
+        "industry_capital_score": row.get("industry_capital_score"),
+        "industry_capital_grade": row.get("industry_capital_grade"),
+        "industry_capital_reason": row.get("industry_capital_reason"),
+        "industry_capital_ratio": row.get("industry_capital_ratio"),
         "industry": row.get("industry_category"),
         "theme": row.get("industry_theme"),
         "monthly_revenue_yoy": row.get("yoy"),
@@ -4186,6 +4506,10 @@ def write_strategy_tracker(
             "macro_catalyst_score": row.get("macro_catalyst_score"),
             "macro_catalyst_note": row.get("macro_catalyst_note"),
             "macro_context": row.get("macro_context"),
+            "industry_capital_score": row.get("industry_capital_score"),
+            "industry_capital_grade": row.get("industry_capital_grade"),
+            "industry_capital_reason": row.get("industry_capital_reason"),
+            "industry_capital_ratio": row.get("industry_capital_ratio"),
             "eps_change_pct": row.get("eps_change_pct"),
             "risk_penalty": row.get("risk_penalty"),
             "opportunity_score": row.get("opportunity_score"),
