@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import csv
+import hashlib
 import io
 import json
 import math
@@ -58,6 +59,7 @@ DATA_SOURCE_STATUS = {
     "margin": "TWSE",
     "revenue_filter": "unknown",
     "candidate_pool": "unknown",
+    "candidate_audit": "unknown",
     "industry_rs": "unknown",
     "valuation": "unknown",
     "financial_quality": "unknown",
@@ -78,6 +80,7 @@ DATA_SOURCE_STATUS = {
     "gemini_review": "disabled",
 }
 FINMIND_REQUEST_COUNT = 0
+UNIVERSE_REJECTION_REASONS: dict[str, str] = {}
 
 THEME_BY_STOCK_ID: dict[str, str] | None = None
 
@@ -2145,6 +2148,8 @@ def build_investable_universe(
     event_risk_map: dict[str, StockRow],
     price_history: dict[str, list[StockRow]],
 ) -> list[StockRow]:
+    global UNIVERSE_REJECTION_REASONS
+    UNIVERSE_REJECTION_REASONS = {}
     min_latest_volume = env_float("AI_STOCK_UNIVERSE_MIN_LATEST_VOLUME_LOTS", 100.0) * 1000
     min_avg_volume = env_float("AI_STOCK_UNIVERSE_MIN_AVG_VOLUME_LOTS", 200.0) * 1000
     min_turnover = env_float("AI_STOCK_UNIVERSE_MIN_TURNOVER_TWD", 20000000.0)
@@ -2162,16 +2167,21 @@ def build_investable_universe(
     }
 
     rejected: Counter[str] = Counter()
+    def reject(stock_id: str, reason: str) -> None:
+        rejected[reason] += 1
+        if stock_id:
+            UNIVERSE_REJECTION_REASONS[stock_id] = reason
+
     investable: list[StockRow] = []
     for source_row in rows:
         stock_id = str(source_row.get("stock_id") or "")
         if not re.fullmatch(r"\d{4}", stock_id):
-            rejected["not_common_stock"] += 1
+            reject(stock_id, "not_common_stock")
             continue
         records = price_history.get(stock_id, [])
         inst_records = institutional.get(stock_id, [])
         if not inst_records:
-            rejected["missing_institutional"] += 1
+            reject(stock_id, "missing_institutional")
             continue
         price_dates = {
             normalize_market_date(item.get("date"))
@@ -2185,7 +2195,7 @@ def build_investable_universe(
         }
         common_dates = price_dates & institutional_dates
         if not common_dates:
-            rejected["date_mismatch"] += 1
+            reject(stock_id, "date_mismatch")
             continue
         aligned_date = max(common_dates)
         aligned_records = [
@@ -2194,7 +2204,7 @@ def build_investable_universe(
             if normalize_market_date(item.get("date")) <= aligned_date
         ]
         if len(aligned_records) < 60:
-            rejected["price_history_lt_60"] += 1
+            reject(stock_id, "price_history_lt_60")
             continue
         market_type = str(
             source_row.get("market_type")
@@ -2202,24 +2212,24 @@ def build_investable_universe(
             or ""
         )
         if aligned_date not in recent_market_dates_by_type.get(market_type, [aligned_date]):
-            rejected["stale_common_date"] += 1
+            reject(stock_id, "stale_common_date")
             continue
         technical = calculate_technical_from_records(aligned_records)
         event = event_risk_map.get(stock_id, {})
         if event.get("event_risk_flags") or event.get("event_risk_level"):
-            rejected["event_risk"] += 1
+            reject(stock_id, "event_risk")
             continue
         if float(technical.get("close") or 0.0) < min_close:
-            rejected["low_price"] += 1
+            reject(stock_id, "low_price")
             continue
         if float(technical.get("latest_volume") or 0.0) < min_latest_volume:
-            rejected["low_latest_volume"] += 1
+            reject(stock_id, "low_latest_volume")
             continue
         if float(technical.get("volume_20d_avg") or 0.0) < min_avg_volume:
-            rejected["low_avg_volume"] += 1
+            reject(stock_id, "low_avg_volume")
             continue
         if float(technical.get("turnover_20d_avg") or 0.0) < min_turnover:
-            rejected["low_turnover"] += 1
+            reject(stock_id, "low_turnover")
             continue
 
         enriched = enrich_revenue_candidate(source_row, margins)
@@ -2576,6 +2586,187 @@ def merge_preselection_pools(
         f"universe={len(universe)} deep={len(merged)} target={target}"
     )
     return merged
+
+
+AUDIT_REJECTION_LABELS = {
+    "not_common_stock": "不屬於上市櫃普通股",
+    "missing_institutional": "法人資料缺漏",
+    "date_mismatch": "股價與法人日期無共同交易日",
+    "price_history_lt_60": "價量歷史不足60日",
+    "stale_common_date": "共同交易日過舊",
+    "event_risk": "注意或處置等事件風險",
+    "low_price": "股價低於母體門檻",
+    "low_latest_volume": "當日成交量低於母體門檻",
+    "low_avg_volume": "20日均量低於母體門檻",
+    "low_turnover": "成交金額低於母體門檻",
+}
+
+
+def candidate_pool_hash(stock_ids: list[str]) -> str:
+    canonical = ",".join(sorted(set(stock_ids)))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def removed_candidate_reason(
+    stock_id: str,
+    universe_by_id: dict[str, StockRow],
+    cutoff_score: float,
+) -> str:
+    rejected_reason = UNIVERSE_REJECTION_REASONS.get(stock_id)
+    if rejected_reason:
+        return AUDIT_REJECTION_LABELS.get(rejected_reason, rejected_reason)
+    row = universe_by_id.get(stock_id)
+    if not row:
+        return "未進入今日可投資母體"
+    timing_flags = str(row.get("entry_timing_flags") or "")
+    if not row.get("entry_timing_pass") and timing_flags:
+        return f"進場時機風險：{timing_flags}"
+    floor_reason = str(row.get("fundamental_floor_reason") or "")
+    if not row.get("fundamental_floor_pass") and floor_reason:
+        return f"基本面底線轉弱：{floor_reason}"
+    score = float(row.get("composite_pre_score") or 0.0)
+    return f"多路候選排名下降；綜合預分{score:.1f}，截止分{cutoff_score:.1f}"
+
+
+def audit_candidate_pool(candidates: list[StockRow], universe: list[StockRow]) -> dict[str, Any]:
+    today = env_str("AI_STOCK_AUDIT_DATE_OVERRIDE", datetime.now(TAIPEI_TZ).date().isoformat())
+    target = env_int("AI_STOCK_DEEP_ANALYSIS_LIMIT", 220)
+    current_ids = [str(row.get("stock_id") or "") for row in candidates if row.get("stock_id")]
+    current_hash = candidate_pool_hash(current_ids)
+    common_dates = sorted(
+        {
+            normalize_market_date(row.get("aligned_trade_date") or row.get("latest_trade_date"))
+            for row in candidates
+            if normalize_market_date(row.get("aligned_trade_date") or row.get("latest_trade_date"))
+        }
+    )
+    common_date_text = ",".join(common_dates)
+    universe_by_id = {str(row.get("stock_id") or ""): row for row in universe}
+    cutoff_score = min(
+        (float(row.get("composite_pre_score") or 0.0) for row in candidates),
+        default=0.0,
+    )
+
+    cached = read_cache("candidate_pool_audit_history") or {}
+    history = cached.get("history", []) if isinstance(cached, dict) else []
+    history = [item for item in history if isinstance(item, dict)]
+    prior_days = sorted(
+        (item for item in history if str(item.get("audit_date") or "") < today),
+        key=lambda item: str(item.get("audit_date") or ""),
+    )
+    previous = prior_days[-1] if prior_days else None
+    previous_entries = {
+        str(item.get("stock_id") or ""): item
+        for item in (previous.get("candidates", []) if previous else [])
+        if isinstance(item, dict) and item.get("stock_id")
+    }
+    previous_ids = set(previous_entries)
+    current_id_set = set(current_ids)
+    added_ids = [stock_id for stock_id in current_ids if stock_id not in previous_ids]
+    removed_ids = sorted(previous_ids - current_id_set)
+    overlap_count = len(current_id_set & previous_ids)
+    overlap_ratio = overlap_count / len(current_id_set) if current_id_set else 0.0
+    identical_streak = (
+        int(previous.get("identical_streak") or 1) + 1
+        if previous and str(previous.get("pool_hash") or "") == current_hash
+        else 1
+    )
+    stale_trade_date_streak = (
+        int(previous.get("stale_trade_date_streak") or 1) + 1
+        if previous
+        and common_date_text
+        and str(previous.get("common_trade_dates") or "") == common_date_text
+        else 1
+    )
+
+    current_entries = []
+    for rank, row in enumerate(candidates, start=1):
+        sources = row.get("candidate_sources") or [row.get("candidate_source") or "composite_fill"]
+        current_entries.append(
+            {
+                "rank": rank,
+                "stock_id": str(row.get("stock_id") or ""),
+                "stock_name": str(row.get("stock_name") or ""),
+                "candidate_sources": [str(item) for item in sources],
+                "composite_pre_score": round(float(row.get("composite_pre_score") or 0.0), 2),
+                "fundamental_pre_score": round(float(row.get("fundamental_pre_score") or 0.0), 2),
+                "early_capital_score": round(float(row.get("early_capital_score") or 0.0), 2),
+                "early_position_score": round(float(row.get("early_position_score") or 0.0), 2),
+                "aligned_trade_date": str(row.get("aligned_trade_date") or ""),
+            }
+        )
+    current_entry_by_id = {item["stock_id"]: item for item in current_entries}
+    added = [
+        {
+            **current_entry_by_id[stock_id],
+            "reason": "進入候選來源：" + ",".join(current_entry_by_id[stock_id]["candidate_sources"]),
+        }
+        for stock_id in added_ids
+    ]
+    removed = [
+        {
+            "stock_id": stock_id,
+            "stock_name": str(previous_entries[stock_id].get("stock_name") or ""),
+            "previous_rank": previous_entries[stock_id].get("rank"),
+            "previous_composite_pre_score": previous_entries[stock_id].get("composite_pre_score"),
+            "reason": removed_candidate_reason(stock_id, universe_by_id, cutoff_score),
+        }
+        for stock_id in removed_ids
+    ]
+
+    warnings: list[str] = []
+    if len(current_ids) < min(target, len(universe)):
+        warnings.append("pool_not_full")
+    if previous and identical_streak >= env_int("AI_STOCK_AUDIT_IDENTICAL_WARN_DAYS", 3):
+        warnings.append("pool_identical_multiple_days")
+    if previous and stale_trade_date_streak >= env_int("AI_STOCK_AUDIT_STALE_DATE_WARN_DAYS", 2):
+        warnings.append("common_trade_date_not_advanced")
+    if not common_date_text:
+        warnings.append("common_trade_date_missing")
+
+    snapshot = {
+        "schema": "candidate_pool_audit_v1",
+        "audit_date": today,
+        "generated_at": datetime.now(TAIPEI_TZ).isoformat(),
+        "status": "warning" if warnings else "normal",
+        "warnings": warnings,
+        "target_count": target,
+        "candidate_count": len(current_ids),
+        "investable_count": len(universe),
+        "added_count": len(added),
+        "removed_count": len(removed),
+        "overlap_count": overlap_count,
+        "overlap_ratio": round(overlap_ratio, 4),
+        "pool_hash": current_hash,
+        "common_trade_dates": common_date_text,
+        "identical_streak": identical_streak,
+        "stale_trade_date_streak": stale_trade_date_streak,
+        "cutoff_composite_pre_score": round(cutoff_score, 2),
+        "added": added,
+        "removed": removed,
+        "candidates": current_entries,
+    }
+    history = [item for item in history if str(item.get("audit_date") or "") != today]
+    history.append(snapshot)
+    history.sort(key=lambda item: str(item.get("audit_date") or ""))
+    write_cache(
+        "candidate_pool_audit_history",
+        {"schema": "candidate_pool_audit_history_v1", "history": history[-30:]},
+    )
+    write_cache("candidate_pool_audit_latest", snapshot)
+    DATA_SOURCE_STATUS["candidate_audit"] = (
+        f"status={snapshot['status']} added={len(added)} removed={len(removed)} "
+        f"overlap={overlap_ratio * 100:.1f}% hash={current_hash[:12]} "
+        f"trade_date={common_date_text or 'missing'} identical={identical_streak} "
+        f"stale={stale_trade_date_streak} warnings={','.join(warnings) or 'none'}"
+    )
+    if warnings:
+        print(
+            "AI_STOCK_CANDIDATE_AUDIT_WARNING "
+            f"date={today} hash={current_hash[:12]} trade_date={common_date_text or 'missing'} "
+            f"warnings={','.join(warnings)}"
+        )
+    return snapshot
 
 
 def enrich_revenue_candidate(row: StockRow, margins: dict[str, dict[str, float]]) -> StockRow:
@@ -4045,6 +4236,7 @@ def build_v2_selection() -> tuple[list[StockRow], list[StockRow], list[StockRow]
     ready, status = check_data_completeness(top_stocks + opportunity_stocks + watchlist_stocks + radar_stocks)
     if not ready:
         DATA_SOURCE_STATUS["data_completeness"] = status
+    audit_candidate_pool(candidates, universe)
     apply_recommendation_history(top_stocks, opportunity_stocks, watchlist_stocks, radar_stocks)
     return top_stocks, opportunity_stocks, watchlist_stocks, radar_stocks, exit_alerts
 
@@ -4556,6 +4748,41 @@ def _readable_industry_capital_status(status: str) -> str:
     return "；".join(items) if items else text
 
 
+def _readable_candidate_audit(status: str) -> str:
+    text = str(status or "")
+    if not text or text == "unknown":
+        return "尚未建立"
+    state = _status_value(text, "status") or "unknown"
+    added = _status_value(text, "added") or "0"
+    removed = _status_value(text, "removed") or "0"
+    overlap = _status_value(text, "overlap") or "0%"
+    pool_hash = _status_value(text, "hash") or "missing"
+    trade_date = _status_value(text, "trade_date") or "missing"
+    warnings = _status_value(text, "warnings") or "none"
+    warning_labels = {
+        "pool_not_full": "候選池不足",
+        "pool_identical_multiple_days": "候選池連續多日相同",
+        "common_trade_date_not_advanced": "共同交易日未更新",
+        "common_trade_date_missing": "共同交易日缺漏",
+    }
+    date_labels = [
+        f"{value[:4]}-{value[4:6]}-{value[6:8]}"
+        if len(value) == 8 and value.isdigit()
+        else value
+        for value in trade_date.split(",")
+    ]
+    readable_warnings = "、".join(
+        warning_labels.get(item, item)
+        for item in warnings.split(",")
+        if item and item != "none"
+    )
+    state_label = "正常" if state == "normal" else f"警示({readable_warnings or '資料異常'})"
+    return (
+        f"新增{added} / 退出{removed} / 重複{overlap} / "
+        f"交易日{','.join(date_labels)} / 池碼{pool_hash} / {state_label}"
+    )
+
+
 def _readable_exit_alert_status(status: str) -> str:
     text = str(status or "")
     if not text or text in {"unknown", "empty"}:
@@ -4578,6 +4805,7 @@ def _readable_top_summary(rows: list[StockRow]) -> list[str]:
     deep = _status_value(DATA_SOURCE_STATUS.get("preselection", ""), "deep") or "0"
     return [
         f"全市場篩選：可投資 {investable} 檔 / 深度分析 {deep} 檔",
+        f"候選稽核：{_readable_candidate_audit(DATA_SOURCE_STATUS.get('candidate_audit', 'unknown'))}",
         f"大盤濾網：{_readable_market_score(DATA_SOURCE_STATUS.get('market_score', 'unknown'))}",
         f"產業輪動：{_readable_industry_momentum(DATA_SOURCE_STATUS.get('industry_momentum', 'unknown'))}",
         f"法人資金產業：{_readable_industry_capital_status(DATA_SOURCE_STATUS.get('industry_capital', 'unknown'))}",
@@ -5557,6 +5785,7 @@ def write_strategy_tracker(
 def print_run_metrics(phase: str, started_at: datetime, started_perf: float, counts: dict[str, int]) -> None:
     elapsed = time.perf_counter() - started_perf
     finished_at = datetime.now(TAIPEI_TZ)
+    audit_status = DATA_SOURCE_STATUS.get("candidate_audit", "unknown")
     print(
         "AI_STOCK_RUN_METRICS "
         f"phase={phase} "
@@ -5564,6 +5793,9 @@ def print_run_metrics(phase: str, started_at: datetime, started_perf: float, cou
         f"finished_at={finished_at.isoformat()} "
         f"elapsed_seconds={elapsed:.1f} "
         f"candidate_pool={DATA_SOURCE_STATUS.get('candidate_pool', 'unknown')} "
+        f"audit_status={_status_value(audit_status, 'status') or 'unknown'} "
+        f"audit_hash={_status_value(audit_status, 'hash') or 'unknown'} "
+        f"audit_trade_date={_status_value(audit_status, 'trade_date') or 'unknown'} "
         f"top={counts.get('top', 0)} "
         f"opportunity={counts.get('opportunity', 0)} "
         f"watchlist={counts.get('watchlist', 0)} "
