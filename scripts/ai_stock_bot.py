@@ -65,12 +65,39 @@ DATA_SOURCE_STATUS = {
     "strategy_tracker": "unknown",
     "market_score": "unknown",
     "industry_momentum": "unknown",
+    "macro_theme": "unknown",
     "exit_alerts": "unknown",
     "gemini_review": "disabled",
 }
 FINMIND_REQUEST_COUNT = 0
 
 THEME_BY_STOCK_ID: dict[str, str] | None = None
+
+MACRO_THEME_STOCKS: dict[str, set[str]] = {
+    "energy_petrochemical": {
+        "1301",
+        "1303",
+        "1304",
+        "1305",
+        "1308",
+        "1309",
+        "1310",
+        "1312",
+        "1313",
+        "1314",
+        "1319",
+        "1326",
+        "6505",
+    },
+    "shipping_logistics": {"2603", "2605", "2606", "2609", "2610", "2615", "2618", "2636"},
+    "raw_materials": {"2002", "2027", "2014", "2015", "2023", "2025"},
+}
+
+MACRO_THEME_CONTEXT: dict[str, str] = {
+    "energy_petrochemical": "Oil price, refining spread, Hormuz/geopolitical supply risk",
+    "shipping_logistics": "Freight rate, route disruption, port congestion",
+    "raw_materials": "Commodity price and cyclical restocking",
+}
 
 
 class RunDeadlineExceeded(TimeoutError):
@@ -876,6 +903,9 @@ def load_theme_map() -> dict[str, str]:
 
 def classify_industry_theme(row: StockRow) -> str:
     stock_id = str(row.get("stock_id") or "")
+    for theme, stock_ids in MACRO_THEME_STOCKS.items():
+        if stock_id in stock_ids:
+            return theme
     theme_map = load_theme_map()
     if stock_id in theme_map:
         return theme_map[stock_id]
@@ -1141,6 +1171,10 @@ def opportunity_industry_priority(row: StockRow) -> tuple[float, str]:
     industry = str(row.get("industry_category") or "")
     name = str(row.get("stock_name") or "")
     text = f"{theme} {industry} {name}".lower()
+    if theme == "energy_petrochemical":
+        return 16.0, "energy_petrochemical_macro"
+    if theme in {"shipping_logistics", "raw_materials"}:
+        return 12.0, f"{theme}_macro"
     if any(
         keyword.lower() in text
         for keyword in [
@@ -1552,6 +1586,40 @@ def calculate_industry_score(row: StockRow) -> float:
     return round(clip(score, 0, 10), 2)
 
 
+def calculate_macro_catalyst_score(row: StockRow) -> tuple[float, str]:
+    if not env_bool("AI_STOCK_ENABLE_MACRO_THEME_CANDIDATES", True):
+        return 0.0, "macro_disabled"
+    theme = str(row.get("industry_theme") or row.get("macro_theme") or "")
+    if theme not in MACRO_THEME_CONTEXT:
+        return 0.0, "macro_not_applicable"
+
+    score = 1.0
+    notes = [theme]
+    price_change_20d = float(row.get("price_change_20d") or 0.0)
+    volume_ratio = float(row.get("volume_ratio") or 0.0)
+    institutional_10d = float(row.get("institutional_10d_sum") or 0.0)
+    latest_institutional = float(row.get("latest_institutional_net") or 0.0)
+    mom = float(row.get("mom") or 0.0)
+
+    if institutional_10d > 0:
+        score += 1.5
+        notes.append("10d_institutional_buy")
+    if latest_institutional > 0:
+        score += 0.8
+        notes.append("latest_institutional_buy")
+    if 0 <= price_change_20d <= 35:
+        score += 0.9
+        notes.append("price_confirmed_not_overheated")
+    if 0.7 <= volume_ratio <= 2.5:
+        score += 0.6
+        notes.append("volume_confirmed")
+    if mom > 0:
+        score += 0.4
+        notes.append("revenue_mom_positive")
+
+    return round(clip(score, 0, 5), 2), ",".join(notes[:5])
+
+
 def calculate_risk_penalty(row: StockRow) -> tuple[float, list[str]]:
     penalty = 0.0
     notes = []
@@ -1637,6 +1705,7 @@ def apply_institutional_growth_model(rows: list[StockRow]) -> None:
         valuation_score = calculate_valuation_score(row)
         industry_score = calculate_industry_score(row)
         eps_acceleration_score, eps_acceleration_note = calculate_eps_acceleration_score(row)
+        macro_catalyst_score, macro_catalyst_note = calculate_macro_catalyst_score(row)
         risk_penalty, risk_notes = calculate_risk_penalty(row)
         total_score = (
             fundamental_weighted
@@ -1645,11 +1714,12 @@ def apply_institutional_growth_model(rows: list[StockRow]) -> None:
             + valuation_score
             + industry_score
             + eps_acceleration_score
+            + macro_catalyst_score
             - risk_penalty
         )
         grade = model_grade(total_score)
 
-        row["model_version"] = "V2.1 Institutional Growth + EPS Trial"
+        row["model_version"] = "V2.2 Institutional Growth + Macro Theme"
         row["legacy_score"] = round(legacy_score, 2)
         row["fundamental_score"] = round(fundamental_weighted, 2)
         row["chip_score"] = round(chip_weighted, 2)
@@ -1658,6 +1728,8 @@ def apply_institutional_growth_model(rows: list[StockRow]) -> None:
         row["industry_score"] = round(industry_score, 2)
         row["eps_acceleration_score"] = eps_acceleration_score
         row["eps_acceleration_note"] = eps_acceleration_note
+        row["macro_catalyst_score"] = macro_catalyst_score
+        row["macro_catalyst_note"] = macro_catalyst_note
         row["risk_penalty"] = risk_penalty
         row["risk_notes"] = risk_notes
         row["total_score"] = round(clip(total_score, 0, 100), 2)
@@ -1892,22 +1964,98 @@ def select_institutional_candidates(
     return candidates[:limit]
 
 
-def merge_candidate_pools(fundamental: list[StockRow], institutional_candidates: list[StockRow]) -> list[StockRow]:
+def select_macro_theme_candidates(
+    rows: list[StockRow],
+    margins: dict[str, dict[str, float]],
+    institutional: dict[str, list[dict[str, float]]],
+    existing: list[StockRow],
+) -> list[StockRow]:
+    if not env_bool("AI_STOCK_ENABLE_MACRO_THEME_CANDIDATES", True):
+        DATA_SOURCE_STATUS["macro_theme"] = "disabled"
+        return []
+
+    limit = env_int("AI_STOCK_MACRO_CANDIDATE_LIMIT", 25)
+    min_score = env_float("AI_STOCK_MACRO_CANDIDATE_MIN_SCORE", 12.0)
+    existing_ids = {row["stock_id"] for row in existing}
+    macro_ids = set().union(*MACRO_THEME_STOCKS.values())
+    candidates: list[StockRow] = []
+
+    for row in rows:
+        stock_id = str(row.get("stock_id") or "")
+        if stock_id in existing_ids or stock_id not in macro_ids:
+            continue
+
+        theme = next((name for name, stock_ids in MACRO_THEME_STOCKS.items() if stock_id in stock_ids), "macro")
+        records = institutional.get(stock_id, [])
+        institutional_score, reason = institutional_candidate_score(stock_id, records, row)
+        yoy = float(row.get("yoy") or 0.0)
+        mom = float(row.get("mom") or 0.0)
+        acc_yoy = float(row.get("acc_yoy") or 0.0)
+        monthly_revenue = float(row.get("monthly_revenue") or 0.0)
+
+        macro_score = 10.0
+        macro_score += clip(institutional_score, 0, 40) * 0.45
+        if yoy > 0:
+            macro_score += 4
+        if mom > 0:
+            macro_score += 3
+        if acc_yoy > 0:
+            macro_score += 3
+        if monthly_revenue >= env_float("AI_STOCK_MIN_MONTHLY_REVENUE", 80000.0):
+            macro_score += 3
+
+        if macro_score < min_score:
+            continue
+
+        enriched = enrich_revenue_candidate(row, margins)
+        enriched["candidate_source"] = "macro_theme"
+        enriched["macro_theme"] = theme
+        enriched["macro_context"] = MACRO_THEME_CONTEXT.get(theme, theme)
+        enriched["macro_candidate_score"] = round(macro_score, 2)
+        enriched["institutional_candidate_score"] = institutional_score
+        enriched["institutional_candidate_reason"] = reason
+        candidates.append(enriched)
+
+    candidates.sort(
+        key=lambda row: (
+            float(row.get("macro_candidate_score") or 0.0),
+            float(row.get("institutional_candidate_score") or 0.0),
+            float(row.get("mom") or 0.0),
+            float(row.get("yoy") or 0.0),
+        ),
+        reverse=True,
+    )
+    selected = candidates[:limit]
+    DATA_SOURCE_STATUS["macro_theme"] = (
+        f"enabled candidates={len(selected)} source=static_watchlist themes="
+        + ",".join(sorted({str(row.get("macro_theme") or "") for row in selected if row.get("macro_theme")})[:5])
+    )
+    return selected
+
+
+def merge_candidate_pools(
+    fundamental: list[StockRow],
+    institutional_candidates: list[StockRow],
+    macro_candidates: list[StockRow] | None = None,
+) -> list[StockRow]:
     merged: list[StockRow] = []
     seen: set[str] = set()
-    for row in fundamental:
-        row["candidate_source"] = str(row.get("candidate_source") or "fundamental")
-        if row["stock_id"] in seen:
-            continue
-        merged.append(row)
-        seen.add(row["stock_id"])
-    for row in institutional_candidates:
-        if row["stock_id"] in seen:
-            continue
-        merged.append(row)
-        seen.add(row["stock_id"])
+
+    for pool, default_source in [
+        (fundamental, "fundamental"),
+        (institutional_candidates, "institutional"),
+        (macro_candidates or [], "macro_theme"),
+    ]:
+        for row in pool:
+            row["candidate_source"] = str(row.get("candidate_source") or default_source)
+            if row["stock_id"] in seen:
+                continue
+            merged.append(row)
+            seen.add(row["stock_id"])
+
     DATA_SOURCE_STATUS["candidate_pool"] = (
-        f"fundamental={len(fundamental)} institutional={len(institutional_candidates)} merged={len(merged)}"
+        f"fundamental={len(fundamental)} institutional={len(institutional_candidates)} "
+        f"macro={len(macro_candidates or [])} merged={len(merged)}"
     )
     return merged
 
@@ -2555,7 +2703,13 @@ def build_v2_selection() -> tuple[list[StockRow], list[StockRow], list[StockRow]
     fundamental_candidates = select_fundamental_candidates(revenue_rows, margins)
     institutional = fetch_institutional_maps()
     institutional_candidates = select_institutional_candidates(revenue_rows, margins, institutional, fundamental_candidates)
-    candidates = merge_candidate_pools(fundamental_candidates, institutional_candidates)
+    macro_candidates = select_macro_theme_candidates(
+        revenue_rows,
+        margins,
+        institutional,
+        fundamental_candidates + institutional_candidates,
+    )
+    candidates = merge_candidate_pools(fundamental_candidates, institutional_candidates, macro_candidates)
     margin_map = fetch_margin_map()
     event_risk_map = fetch_event_risk_map()
     top_limit = env_int("AI_STOCK_TOP_LIMIT", 10)
@@ -2928,6 +3082,9 @@ THEME_LABELS = {
     "semiconductor_equipment": "半導體設備",
     "electronics": "電子科技",
     "memory_storage": "記憶體/儲存",
+    "energy_petrochemical": "能源/石化",
+    "shipping_logistics": "航運/物流",
+    "raw_materials": "原物料",
     "construction_property": "營建資產",
     "unknown": "未分類",
 }
@@ -3107,6 +3264,24 @@ def _readable_industry_momentum(status: str) -> str:
     return "；".join(items) if items else "暫無明顯產業輪動"
 
 
+def _readable_macro_theme_status(status: str) -> str:
+    text = str(status or "")
+    if not text or text == "unknown":
+        return "未啟用"
+    if text == "disabled":
+        return "未啟用"
+    candidates = _status_value(text, "candidates")
+    themes = _status_value(text, "themes") or ""
+    labels = [
+        _readable_theme(theme.strip())
+        for theme in str(themes).split(",")
+        if theme.strip()
+    ]
+    if candidates is not None:
+        return f"{candidates} 檔" + (f"；{ '、'.join(labels) }" if labels else "")
+    return text
+
+
 def _readable_exit_alert_status(status: str) -> str:
     text = str(status or "")
     if not text or text in {"unknown", "empty"}:
@@ -3128,6 +3303,7 @@ def _readable_top_summary(rows: list[StockRow]) -> list[str]:
     return [
         f"大盤濾網：{_readable_market_score(DATA_SOURCE_STATUS.get('market_score', 'unknown'))}",
         f"產業輪動：{_readable_industry_momentum(DATA_SOURCE_STATUS.get('industry_momentum', 'unknown'))}",
+        f"宏觀候選：{_readable_macro_theme_status(DATA_SOURCE_STATUS.get('macro_theme', 'unknown'))}",
         f"今日等級：A {a_count} / B {b_count} / C {c_count}",
         f"Exit Alert：{_readable_exit_alert_status(DATA_SOURCE_STATUS.get('exit_alerts', 'unknown'))}",
         f"追蹤紀錄：{_compact_tracker_status(DATA_SOURCE_STATUS.get('strategy_tracker', 'unknown'))}",
@@ -3207,7 +3383,7 @@ def build_line_message(
         strong = " 三率三升" if row.get("triple_margin_up") else ""
         lines.extend([
             f"{rank}. {row['stock_id']} {row['stock_name']}{strong}",
-            f"{row.get('model_grade', '')}級｜總分 {row['total_score']:.1f}｜基本 {row['fundamental_score']:.1f} 技術 {row['technical_score']:.1f} 籌碼 {row['chip_score']:.1f} 估值 {row.get('valuation_score', 0):.1f} 產業 {row.get('industry_score', 0):.1f} EPS加速 {row.get('eps_acceleration_score', 0):.1f}",
+            f"{row.get('model_grade', '')}級｜總分 {row['total_score']:.1f}｜基本 {row['fundamental_score']:.1f} 技術 {row['technical_score']:.1f} 籌碼 {row['chip_score']:.1f} 估值 {row.get('valuation_score', 0):.1f} 產業 {row.get('industry_score', 0):.1f} EPS加速 {row.get('eps_acceleration_score', 0):.1f} 宏觀 {row.get('macro_catalyst_score', 0):.1f}",
             f"{_readable_market_meta(row)}｜營收 YoY {row['yoy']:.1f}% / 累計 {row['acc_yoy']:.1f}%｜1日 {row.get('price_change_1d', 0):.1f}%｜20日 {row['price_change_20d']:.1f}%｜量比 {row['volume_ratio']:.2f}x｜{breakout}｜{_readable_theme(row.get('industry_theme'))}",
             f"外資5日 {shares_to_lots(row['foreign_5d_sum']):,.0f}張｜投信5日 {shares_to_lots(row['trust_5d_sum']):,.0f}張｜MA {row['ma5']:.1f}>{row['ma20']:.1f}>{row['ma60']:.1f}",
         ])
@@ -3330,6 +3506,9 @@ def compact_for_gemini(row: StockRow, bucket: str) -> dict[str, Any]:
         "valuation_score": row.get("valuation_score"),
         "industry_score": row.get("industry_score"),
         "eps_acceleration_score": row.get("eps_acceleration_score"),
+        "macro_catalyst_score": row.get("macro_catalyst_score"),
+        "macro_catalyst_note": row.get("macro_catalyst_note"),
+        "macro_context": row.get("macro_context"),
         "industry": row.get("industry_category"),
         "theme": row.get("industry_theme"),
         "monthly_revenue_yoy": row.get("yoy"),
@@ -3362,8 +3541,10 @@ def compact_for_gemini(row: StockRow, bucket: str) -> dict[str, Any]:
 def gemini_prompt(candidates: list[dict[str, Any]]) -> str:
     payload = {
         "instructions": [
-            "你是台股候選名單覆判助理，只能根據 candidates 內提供的結構化資料判斷。",
-            "不要自行補充未提供的新聞、法說會、未公開消息或即時行情；資料不足時請明確寫資料不足。",
+            "你是台股候選名單覆判助理，只能根據 candidates 內提供的結構化資料與 macro_context 判斷。",
+            "Gemini 不可假裝已經即時上網搜尋新聞；若 macro_context 提到油價、煉油利差、荷姆茲或航運，只能視為需要驗證的題材假設。",
+            "請交叉檢查基本面、法人籌碼、技術面、估值、風險與宏觀題材是否一致。",
+            "請避免只因熱門題材就給高信心；若基本面或法人籌碼不支持，請明確標示風險。",
             "請評估：正向催化、負面風險、成長是否可持續、題材品質、信心分數與一句摘要。",
             "請用繁體中文，避免英文代碼式文字，摘要務必短而清楚。",
             "只回傳 JSON array，每筆包含 stock_id, catalyst, risk, sustainability, theme_quality, confidence, summary。",
@@ -3665,6 +3846,10 @@ def summarize_free_chip_review(entry: dict[str, Any]) -> dict[str, Any]:
         risks.append("估值訊號偏保守")
     if eps_acceleration_score > 0:
         positives.append("EPS加速加分")
+    macro_catalyst_score = entry_float(entry, "macro_catalyst_score")
+    if macro_catalyst_score >= 3:
+        score += 4
+        positives.append("宏觀題材與籌碼/價量有共振")
 
     score = round(clip(score, 0, 100), 1)
     return {
@@ -3710,6 +3895,9 @@ def compact_entry_for_gemini(item: dict[str, Any]) -> dict[str, Any]:
         "valuation_score": entry.get("valuation_score"),
         "industry_score": entry.get("industry_score"),
         "eps_acceleration_score": entry.get("eps_acceleration_score"),
+        "macro_catalyst_score": entry.get("macro_catalyst_score"),
+        "macro_catalyst_note": entry.get("macro_catalyst_note"),
+        "macro_context": entry.get("macro_context"),
         "monthly_revenue_yoy": entry.get("yoy"),
         "monthly_revenue_mom": entry.get("mom"),
         "accumulated_revenue_yoy": entry.get("acc_yoy"),
@@ -4016,6 +4204,9 @@ def write_strategy_tracker(
             "industry_score": row.get("industry_score"),
             "eps_acceleration_score": row.get("eps_acceleration_score"),
             "eps_acceleration_note": row.get("eps_acceleration_note"),
+            "macro_catalyst_score": row.get("macro_catalyst_score"),
+            "macro_catalyst_note": row.get("macro_catalyst_note"),
+            "macro_context": row.get("macro_context"),
             "eps_change_pct": row.get("eps_change_pct"),
             "risk_penalty": row.get("risk_penalty"),
             "opportunity_score": row.get("opportunity_score"),
