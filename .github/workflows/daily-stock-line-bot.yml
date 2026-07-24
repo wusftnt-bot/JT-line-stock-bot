@@ -36,9 +36,8 @@ on:
           - "false"
           - "true"
   schedule:
-    # 19:40-20:30 Asia/Taipei every 5 minutes. GitHub Actions schedules use UTC.
+    # 20:00-20:30 Asia/Taipei every 5 minutes. GitHub Actions schedules use UTC.
     # Frequent slots reduce best-effort schedule misses; sent marker and concurrency prevent duplicates.
-    - cron: "40,45,50,55 11 * * 1-5"
     - cron: "0,5,10,15,20,25,30 12 * * 1-5"
 
 concurrency:
@@ -176,7 +175,7 @@ jobs:
         shell: bash
         run: |
           hm="${{ steps.taipei.outputs.hm }}"
-          if [ "${{ github.event_name }}" = "schedule" ] && { [ "$hm" -lt 1940 ] || [ "$hm" -gt 2030 ]; }; then
+          if [ "${{ github.event_name }}" = "schedule" ] && { [ "$hm" -lt 2000 ] || [ "$hm" -gt 2030 ]; }; then
             echo "allowed=false" >> "$GITHUB_OUTPUT"
             echo "LINE stock bot schedule fired outside Taipei push window; skip push. taipei_hm=$hm"
           else
