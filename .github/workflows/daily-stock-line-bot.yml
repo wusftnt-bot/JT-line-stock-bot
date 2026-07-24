@@ -27,6 +27,14 @@ on:
         options:
           - "false"
           - "true"
+      line_test_push:
+        description: "Prefix the manually dispatched LINE message with [TEST]."
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
   schedule:
     # 19:40-20:30 Asia/Taipei every 5 minutes. GitHub Actions schedules use UTC.
     # Frequent slots reduce best-effort schedule misses; sent marker and concurrency prevent duplicates.
@@ -86,6 +94,7 @@ jobs:
       AI_STOCK_TOP_MIN_CLOSE: "15"
       AI_STOCK_TOP_MAX_1D_DROP: "-4.0"
       AI_STOCK_TOP_MAX_20D_PRICE_CHANGE: "25"
+      AI_STOCK_TOP_MIN_LATEST_INSTITUTIONAL_NET: "0"
       AI_STOCK_TOP_MIN_FUNDAMENTAL_PRE_SCORE: "16"
       AI_STOCK_TOP_MIN_REVENUE_GROWTH: "-5"
       AI_STOCK_TOP_LOSS_HIGH_GROWTH_YOY: "40"
@@ -113,13 +122,12 @@ jobs:
       AI_STOCK_EXIT_ALERT_LIMIT: "5"
       AI_STOCK_EXIT_ALERT_LOOKBACK_DAYS: "20"
       AI_STOCK_EXIT_ALERT_MAX_1D_DROP: "-6.0"
-      AI_STOCK_LINE_TOP_DISPLAY_LIMIT: "5"
+      AI_STOCK_LINE_TOP_DISPLAY_LIMIT: "3"
       AI_STOCK_LINE_OPPORTUNITY_DISPLAY_LIMIT: "3"
       AI_STOCK_LINE_WATCH_DISPLAY_LIMIT: "3"
       AI_STOCK_LINE_RADAR_DISPLAY_LIMIT: "3"
       AI_STOCK_LINE_EXIT_DISPLAY_LIMIT: "3"
       AI_STOCK_LINE_AI_REVIEW_DISPLAY_LIMIT: "3"
-      AI_STOCK_LINE_FLEX_CARD_LIMIT: "9"
       AI_STOCK_GEMINI_REVIEW_LIMIT: "3"
       AI_STOCK_ALLOW_INCOMPLETE_DATA_PUSH: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_latest_available_data == 'true' && 'true' || 'false' }}
       AI_STOCK_MIN_AVG_VOLUME_LOTS: "500"
@@ -134,6 +142,7 @@ jobs:
       AI_STOCK_FAIL_ON_ANALYSIS_ERROR: "true"
       AI_STOCK_MARGIN_RISK_RATIO: "0.20"
       LINE_BROADCAST: "false"
+      LINE_TEST_PUSH: ${{ github.event_name == 'workflow_dispatch' && inputs.line_test_push == 'true' && 'true' || 'false' }}
       DAILY_FINANCE_REPORT_URL: "https://wusftnt-bot.github.io/daily-finance-report/"
       FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

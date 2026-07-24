@@ -1459,6 +1459,7 @@ def evaluate_top_liquidity_quality(row: StockRow, include_model_score: bool = Tr
     price_change_1d = float(row.get("price_change_1d") or 0.0)
     price_change_20d = float(row.get("price_change_20d") or 0.0)
     total_score = float(row.get("total_score") or 0.0)
+    latest_institutional_net = float(row.get("latest_institutional_net") or 0.0)
 
     reasons = []
     if include_model_score and total_score and total_score < min_model_score:
@@ -1483,6 +1484,8 @@ def evaluate_top_liquidity_quality(row: StockRow, include_model_score: bool = Tr
         reasons.append("fundamental_floor")
     if not bool(row.get("entry_timing_pass")):
         reasons.append("entry_timing_risk")
+    if latest_institutional_net < env_float("AI_STOCK_TOP_MIN_LATEST_INSTITUTIONAL_NET", 0.0):
+        reasons.append("latest_institutional_selling")
 
     return not reasons, ",".join(reasons)
 
@@ -1740,6 +1743,7 @@ def calculate_risk_penalty(row: StockRow) -> tuple[float, list[str]]:
     free_cash_flow = float(row.get("free_cash_flow") or 0.0)
     event_risk_level = str(row.get("event_risk_level") or "")
     event_risk_flags = str(row.get("event_risk_flags") or "")
+    latest_institutional_net = float(row.get("latest_institutional_net") or 0.0)
 
     if yoy > env_float("AI_STOCK_RISK_YOY_OVERHEAT", 300.0):
         penalty += 5
@@ -1753,6 +1757,9 @@ def calculate_risk_penalty(row: StockRow) -> tuple[float, list[str]]:
     if foreign_10d < 0 and trust_10d < 0:
         penalty += 5
         notes.append("institutional_selling")
+    if latest_institutional_net < 0:
+        penalty += 4
+        notes.append("latest_institutional_selling")
     if eps < 0:
         penalty += 8
         notes.append("eps_loss")
@@ -4474,6 +4481,7 @@ REASON_LABELS = {
     "far_above_ma20": "股價遠離月線",
     "price_volume_overheat": "價量過熱",
     "latest_institutional_big_sell": "法人最新大幅轉賣",
+    "latest_institutional_selling": "法人當日轉賣",
     "long_upper_wick": "爆量長上影",
     "volume_price_divergence": "爆量價滯",
     "yoy_over_300": "營收年增過熱",
@@ -4845,12 +4853,79 @@ def build_ai_review_lines(
             break
     if not rows:
         return []
-    lines = ["AI質化摘要：僅輔助候選股審查，不取代量化分數"]
+    lines = ["AI質化摘要（3檔）：輔助檢查成長持續性與風險"]
     for row in rows:
         review_line = format_ai_review(row)
         if review_line:
             lines.append(f"{row.get('stock_id')} {row.get('stock_name')}｜{review_line}")
     return lines
+
+
+LINE_CANDIDATE_SOURCE_LABELS = {
+    "fundamental_growth": "基本面成長",
+    "fundamental_turn": "獲利轉折",
+    "early_institutional": "法人早期建倉",
+    "industry_breakout": "產業資金突破",
+    "non_mainstream_breakout": "非主流突破",
+    "composite_fill": "綜合預分",
+}
+
+
+def _line_candidate_sources(row: StockRow, limit: int = 2) -> str:
+    values = row.get("candidate_sources") or str(row.get("candidate_source") or "").split(",")
+    if not isinstance(values, list):
+        values = [str(values)]
+    labels = []
+    for value in values:
+        key = str(value or "").strip()
+        label = LINE_CANDIDATE_SOURCE_LABELS.get(key, key)
+        if label and label not in labels:
+            labels.append(label)
+    return "+".join(labels[:limit]) or "綜合分析"
+
+
+def _line_margin_summary(row: StockRow) -> str:
+    margins = [
+        float(row.get("gross_margin") or 0.0),
+        float(row.get("operating_margin") or 0.0),
+        float(row.get("net_margin") or 0.0),
+    ]
+    if not any(abs(value) >= 0.01 for value in margins):
+        return "毛/營/淨待補"
+    return f"毛/營/淨 {margins[0]:.1f}/{margins[1]:.1f}/{margins[2]:.1f}%"
+
+
+def _line_valuation_summary(row: StockRow) -> str:
+    pe = float(row.get("pe_ratio") or 0.0)
+    pbr = float(row.get("pbr") or 0.0)
+    roe = float(row.get("roe") or 0.0)
+    values = []
+    if pe > 0:
+        values.append(f"PER {pe:.1f}")
+    if pbr > 0:
+        values.append(f"PBR {pbr:.1f}")
+    if roe:
+        values.append(f"ROE {roe:.1f}%")
+    return "/".join(values) if values else "估值來源待補"
+
+
+def _line_latest_institutional(row: StockRow) -> str:
+    foreign = shares_to_lots(row.get("latest_foreign_net", 0))
+    trust = shares_to_lots(row.get("latest_trust_net", 0))
+    dealer = shares_to_lots(row.get("latest_dealer_net", 0))
+    return f"1日外/投/自 {foreign:,.0f}/{trust:,.0f}/{dealer:,.0f}張"
+
+
+def _line_score_breakdown(row: StockRow) -> str:
+    return (
+        f"基{float(row.get('fundamental_score') or 0):.1f} "
+        f"籌{float(row.get('chip_score') or 0):.1f} "
+        f"技{float(row.get('technical_score') or 0):.1f} "
+        f"估{float(row.get('valuation_score') or 0):.1f} "
+        f"產{float(row.get('industry_score') or 0):.1f} "
+        f"EPS{float(row.get('eps_acceleration_score') or 0):+.1f} "
+        f"風險-{float(row.get('risk_penalty') or 0):.1f}"
+    )
 
 
 def build_line_message(
@@ -4864,47 +4939,87 @@ def build_line_message(
     if not rows_for_grade:
         return "AI Stock Bot V2\n====================\n今日沒有股票通過篩選。"
 
+    investable = _status_value(DATA_SOURCE_STATUS.get("investable_universe", ""), "investable") or "0"
+    deep = _status_value(DATA_SOURCE_STATUS.get("preselection", ""), "deep") or "0"
+    audit_status = DATA_SOURCE_STATUS.get("candidate_audit", "unknown")
+    trade_date = format_trade_date(_status_value(audit_status, "trade_date") or "")
     lines = [
-        "AI Stock Bot V2 分層觀察",
+        "AI Stock Bot V2 分層選股",
         f"完整財經看板：{DAILY_FINANCE_REPORT_URL}",
         "",
         _line_grade_note(rows_for_grade),
         "模型：基本面35 + 法人籌碼25 + 技術面20 + 估值10 + 產業10",
         "====================",
+        f"資料日：{trade_date or '待確認'}｜三層篩選：可投資 {investable} → 深度分析 {deep} 檔",
+        f"候選池：{_readable_candidate_pool(DATA_SOURCE_STATUS.get('candidate_pool', 'unknown'))}",
+        f"候選稽核：{_readable_candidate_audit(audit_status)}",
+        f"大盤：{_readable_market_score(DATA_SOURCE_STATUS.get('market_score', 'unknown'))}",
+        f"產業資金：{_readable_industry_capital_status(DATA_SOURCE_STATUS.get('industry_capital', 'unknown'))}",
+        f"產業輪動：{_readable_industry_momentum(DATA_SOURCE_STATUS.get('industry_momentum', 'unknown'))}",
+        (
+            f"分層結果：Top {len(top_stocks)} / 機會 {len(opportunity_stocks)} / "
+            f"Watch {len(watchlist_stocks)} / 雷達 {len(radar_stocks)} / Exit {len(exit_alerts)}"
+        ),
     ]
-    lines.extend(_readable_top_summary(rows_for_grade))
+    ai_review_lines = build_ai_review_lines(
+        top_stocks,
+        opportunity_stocks,
+        watchlist_stocks,
+        radar_stocks,
+    )
+    if ai_review_lines:
+        lines.extend(["====================", *ai_review_lines])
     lines.append("====================")
-    top_display = top_stocks[: env_int("AI_STOCK_LINE_TOP_DISPLAY_LIMIT", 5)]
+    top_display = top_stocks[: env_int("AI_STOCK_LINE_TOP_DISPLAY_LIMIT", 3)]
     opportunity_display = opportunity_stocks[: env_int("AI_STOCK_LINE_OPPORTUNITY_DISPLAY_LIMIT", 3)]
     watchlist_display = watchlist_stocks[: env_int("AI_STOCK_LINE_WATCH_DISPLAY_LIMIT", 3)]
     radar_display = radar_stocks[: env_int("AI_STOCK_LINE_RADAR_DISPLAY_LIMIT", 3)]
+    exit_display = exit_alerts[: env_int("AI_STOCK_LINE_EXIT_DISPLAY_LIMIT", 3)]
 
-    lines.append("正式 Top：品質通過、C級以上、無主要風險扣分" if top_stocks else "正式 Top：今日沒有完全通過品質與風險條件的標的")
+    lines.append(
+        "正式 Top（3檔）：品質、基本面、進場時機通過，且法人當日未轉賣"
+        if top_stocks
+        else "正式 Top：今日沒有完全通過品質、風險與法人當日方向的標的"
+    )
     for row in top_display:
         rank = int(row["rank"])
         breakout = "創120日高" if row.get("break_120d_high") else "未創高"
         strong = " 三率三升" if row.get("triple_margin_up") else ""
         lines.extend([
-            f"{rank}. {row['stock_id']} {row['stock_name']}{strong}｜{row.get('model_grade', '')} {row['total_score']:.1f}｜{_readable_theme(row.get('industry_theme'))}",
-            f"1日 {row.get('price_change_1d', 0):.1f}%｜20日 {row['price_change_20d']:.1f}%｜量比 {row['volume_ratio']:.2f}x｜外資/投信5日 {shares_to_lots(row['foreign_5d_sum']):,.0f}/{shares_to_lots(row['trust_5d_sum']):,.0f}張｜估 {row.get('valuation_score', 0):.1f} 產 {row.get('industry_score', 0):.1f} 宏 {row.get('macro_catalyst_score', 0):.1f}｜{breakout}",
+            f"{rank}. {row['stock_id']} {row['stock_name']}{strong}｜{row.get('model_grade', '')}級 {row['total_score']:.1f}｜{_readable_theme(row.get('industry_theme'))}｜{_line_candidate_sources(row)}",
+            f"分數｜{_line_score_breakdown(row)}",
+            (
+                f"基本｜營收YoY {float(row.get('yoy') or 0):+.1f}% / 累計 {float(row.get('acc_yoy') or 0):+.1f}%｜"
+                f"{_line_margin_summary(row)}｜{_line_valuation_summary(row)}"
+            ),
+            (
+                f"籌碼｜{_line_latest_institutional(row)}｜5日外/投 "
+                f"{shares_to_lots(row.get('foreign_5d_sum', 0)):,.0f}/{shares_to_lots(row.get('trust_5d_sum', 0)):,.0f}張｜"
+                f"1日 {float(row.get('price_change_1d') or 0):+.1f}% / 20日 {float(row.get('price_change_20d') or 0):+.1f}% / 量比 {float(row.get('volume_ratio') or 0):.2f}x｜{breakout}"
+            ),
         ])
 
     if len(top_stocks) > len(top_display):
         lines.append(f"另有 {len(top_stocks) - len(top_display)} 檔正式 Top 未顯示")
 
     if opportunity_display:
-        lines.extend(["====================", "機會股"])
+        lines.extend(["====================", "機會股（3檔）：早期資金與基本面具潛力，尚未通過正式Top全部門檻"])
         for row in opportunity_display:
             lines.extend([
-                f"O{row['opportunity_rank']} {row['stock_id']} {row['stock_name']}｜機會 {row.get('opportunity_score', 0):.1f}｜總 {row['total_score']:.1f}｜{_readable_theme(row.get('industry_theme'))}",
-                f"1日 {row.get('price_change_1d', 0):.1f}%｜20日 {row['price_change_20d']:.1f}%｜量比 {row['volume_ratio']:.2f}x｜外資/投信10日 {shares_to_lots(row['foreign_10d_sum']):,.0f}/{shares_to_lots(row['trust_10d_sum']):,.0f}張",
+                f"O{row['opportunity_rank']} {row['stock_id']} {row['stock_name']}｜機會 {row.get('opportunity_score', 0):.1f} / 總分 {row['total_score']:.1f}｜{_readable_theme(row.get('industry_theme'))}｜{_line_candidate_sources(row)}",
+                f"理由｜{_readable_reason_text(row.get('opportunity_reason'), limit=3)}",
+                (
+                    f"數據｜營收YoY {float(row.get('yoy') or 0):+.1f}%｜{_line_latest_institutional(row)}｜"
+                    f"10日外/投 {shares_to_lots(row.get('foreign_10d_sum', 0)):,.0f}/{shares_to_lots(row.get('trust_10d_sum', 0)):,.0f}張｜"
+                    f"20日 {float(row.get('price_change_20d') or 0):+.1f}% / 量比 {float(row.get('volume_ratio') or 0):.2f}x"
+                ),
             ])
 
         if len(opportunity_stocks) > len(opportunity_display):
             lines.append(f"另有 {len(opportunity_stocks) - len(opportunity_display)} 檔機會股未顯示")
 
     if watchlist_display:
-        lines.extend(["====================", "Watchlist"])
+        lines.extend(["====================", "Watchlist（3檔）：分數具潛力，但有明確未通過條件"])
         for row in watchlist_display:
             reason_values = [
                 row.get("top_quality_reason"),
@@ -4914,22 +5029,54 @@ def build_line_message(
             reason = "；".join(_readable_reason_text(item) for item in reason_values if item)
             lines.extend([
                 f"W{row['watch_rank']} {row['stock_id']} {row['stock_name']}｜總 {row['total_score']:.1f}｜{_readable_theme(row.get('industry_theme'))}",
-                f"1日 {row.get('price_change_1d', 0):.1f}%｜20日 {row['price_change_20d']:.1f}%｜外資/投信5日 {shares_to_lots(row['foreign_5d_sum']):,.0f}/{shares_to_lots(row['trust_5d_sum']):,.0f}張｜{reason or '觀察'}",
+                f"未通過｜{reason or '觀察'}",
+                (
+                    f"數據｜營收YoY {float(row.get('yoy') or 0):+.1f}%｜{_line_latest_institutional(row)}｜"
+                    f"5日外/投 {shares_to_lots(row.get('foreign_5d_sum', 0)):,.0f}/{shares_to_lots(row.get('trust_5d_sum', 0)):,.0f}張｜"
+                    f"20日 {float(row.get('price_change_20d') or 0):+.1f}% / 量比 {float(row.get('volume_ratio') or 0):.2f}x"
+                ),
             ])
 
     if radar_display:
         lines.extend([
             "====================",
-            "法人建倉雷達",
+            "法人建倉雷達（3檔）：Top與機會股之外的早期籌碼觀察",
         ])
         for row in radar_display:
             quiet = "｜低調建倉" if row.get("quiet_accumulation") else "｜籌碼觀察"
             lines.extend([
                 f"R{row['radar_rank']} {row['stock_id']} {row['stock_name']}｜雷達 {row['accumulation_score']:.1f}{quiet}",
-                f"1日外資/投信 {shares_to_lots(row.get('latest_foreign_net', 0)):,.0f}/{shares_to_lots(row.get('latest_trust_net', 0)):,.0f}張｜近2日法人 {shares_to_lots(row.get('recent_2d_institutional_net', 0)):,.0f}張｜20日 {row['price_change_20d']:.1f}%｜量比 {row['volume_ratio']:.2f}x",
+                (
+                    f"籌碼｜{_line_latest_institutional(row)}｜近2日法人 {shares_to_lots(row.get('recent_2d_institutional_net', 0)):,.0f}張｜"
+                    f"10日外/投 {shares_to_lots(row.get('foreign_10d_sum', 0)):,.0f}/{shares_to_lots(row.get('trust_10d_sum', 0)):,.0f}張"
+                ),
+                (
+                    f"基本｜營收YoY {float(row.get('yoy') or 0):+.1f}% / 累計 {float(row.get('acc_yoy') or 0):+.1f}%｜"
+                    f"20日 {float(row.get('price_change_20d') or 0):+.1f}% / 量比 {float(row.get('volume_ratio') or 0):.2f}x"
+                ),
             ])
         if len(radar_stocks) > len(radar_display):
             lines.append(f"另有 {len(radar_stocks) - len(radar_display)} 檔法人建倉雷達未顯示")
+    if exit_display:
+        lines.extend([
+            "====================",
+            "Exit Alert 持股風險追蹤（3檔）：曾入選且今日風險轉弱",
+        ])
+        for row in exit_display:
+            reasons = _readable_reason_text(row.get("exit_alert_reasons"), limit=3)
+            source_label = {
+                "top": "正式Top",
+                "opportunity": "機會股",
+                "watchlist": "Watchlist",
+                "radar": "法人雷達",
+            }.get(str(row.get("exit_source") or ""), str(row.get("exit_source") or "歷史追蹤"))
+            lines.extend([
+                f"E{row.get('exit_alert_rank')} {row.get('stock_id')} {row.get('stock_name')}｜來源 {source_label}｜{reasons}",
+                (
+                    f"數據｜1日 {float(row.get('price_change_1d') or 0):+.1f}% / 20日 {float(row.get('price_change_20d') or 0):+.1f}%｜"
+                    f"{_line_latest_institutional(row)}"
+                ),
+            ])
     return "\n".join(lines)
 
 
@@ -5409,23 +5556,12 @@ def assert_three_layer_candidate_pipeline_ready() -> None:
     )
 
 
-def push_line_message(message: str, rich_message: dict[str, Any] | None = None) -> None:
+def push_line_message(message: str) -> None:
     message = ensure_finance_reference(message)
     if env_bool("LINE_TEST_PUSH") and not message.startswith("[TEST]"):
         message = f"[TEST] {message}"
     payload_text = trim_line_text(message)
     line_message: dict[str, Any] = {"type": "text", "text": payload_text}
-    bubble_count = 0
-    rich_payload_bytes = 0
-    if rich_message is not None:
-        rich_message = json.loads(json.dumps(rich_message, ensure_ascii=False))
-        if env_bool("LINE_TEST_PUSH") and not str(rich_message.get("altText") or "").startswith("[TEST]"):
-            rich_message["altText"] = f"[TEST] {rich_message.get('altText', '')}"[:LINE_FLEX_ALT_TEXT_LIMIT]
-        try:
-            bubble_count, rich_payload_bytes = validate_line_flex_message(rich_message)
-            line_message = rich_message
-        except ValueError as error:
-            print(f"LINE_FLEX_FALLBACK reason={error}")
 
     channel_access_token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
     line_to = os.getenv("LINE_TO")
@@ -5446,8 +5582,6 @@ def push_line_message(message: str, rich_message: dict[str, Any] | None = None) 
         "LINE_MESSAGE_CHECK "
         f"message_type={line_message.get('type')} "
         f"request_message_objects=1 "
-        f"bubble_count={bubble_count} "
-        f"flex_bytes={rich_payload_bytes} "
         f"finance_url={DAILY_FINANCE_REPORT_URL in json.dumps(line_message, ensure_ascii=False)} "
         f"test_push={payload_text.startswith('[TEST]')} "
         f"payload_length={len(payload_text)}"
@@ -5691,7 +5825,9 @@ def format_ai_review(row: StockRow) -> str | None:
         confidence_text = f"{float(confidence):.0f}/10"
     except (TypeError, ValueError):
         confidence_text = "?/10"
-    return f"AI覆判：{summary}｜信心 {confidence_text}"
+    risk = str(review.get("risk") or "").strip()
+    risk_text = f"｜風險 {risk[:45]}" if risk else ""
+    return f"{summary[:65]}{risk_text}｜信心 {confidence_text}"
 
 
 def entry_float(entry: dict[str, Any], *names: str) -> float:
@@ -6325,7 +6461,6 @@ def main() -> None:
         return
 
     try:
-        flex_message: dict[str, Any] | None = None
         if push_enabled:
             assert_market_close_ready()
         top_stocks, opportunity_stocks, watchlist_stocks, radar_stocks, exit_alerts = build_v2_selection()
@@ -6335,12 +6470,6 @@ def main() -> None:
         write_strategy_tracker(top_stocks, opportunity_stocks, watchlist_stocks, radar_stocks, exit_alerts)
         attach_gemini_reviews(top_stocks, opportunity_stocks, watchlist_stocks, radar_stocks)
         message = build_line_message(top_stocks, opportunity_stocks, watchlist_stocks, radar_stocks, exit_alerts)
-        flex_message = build_line_flex_message(
-            top_stocks,
-            opportunity_stocks,
-            watchlist_stocks,
-            radar_stocks,
-        )
     except Exception as error:
         if not push_enabled:
             raise
@@ -6359,7 +6488,6 @@ def main() -> None:
         watchlist_stocks = []
         radar_stocks = []
         exit_alerts = []
-        flex_message = None
         message = build_data_unavailable_message(error)
     print(message)
     counts = {
@@ -6385,7 +6513,7 @@ def main() -> None:
         write_csv(REPORT_DIR / f"ai-stock-v2-exit-alerts-{today}.csv", exit_alerts)
 
     if push_enabled:
-        push_line_message(message, flex_message)
+        push_line_message(message)
     print_run_metrics("finished", started_at, started_perf, counts)
 
 
