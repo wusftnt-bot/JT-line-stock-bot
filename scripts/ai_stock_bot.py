@@ -5611,6 +5611,12 @@ def push_line_message(message: str) -> None:
 
 
 def compact_for_gemini(row: StockRow, bucket: str) -> dict[str, Any]:
+    margin_fields = ("gross_margin", "operating_margin", "net_margin")
+    margin_values = [row.get(field) for field in margin_fields]
+    margin_data_available = any(
+        value is not None and abs(float(value)) > 1e-9
+        for value in margin_values
+    )
     return {
         "bucket": bucket,
         "stock_id": row.get("stock_id"),
@@ -5637,9 +5643,10 @@ def compact_for_gemini(row: StockRow, bucket: str) -> dict[str, Any]:
         "accumulated_revenue_yoy": row.get("acc_yoy"),
         "eps": row.get("eps"),
         "roe": row.get("roe"),
-        "gross_margin": row.get("gross_margin"),
-        "operating_margin": row.get("operating_margin"),
-        "net_margin": row.get("net_margin"),
+        "margin_data_status": "available" if margin_data_available else "missing",
+        "gross_margin": row.get("gross_margin") if margin_data_available else None,
+        "operating_margin": row.get("operating_margin") if margin_data_available else None,
+        "net_margin": row.get("net_margin") if margin_data_available else None,
         "pe_ratio": row.get("pe_ratio"),
         "pbr": row.get("pbr"),
         "price_change_1d": row.get("price_change_1d"),
@@ -5666,6 +5673,7 @@ def gemini_prompt(candidates: list[dict[str, Any]]) -> str:
             "Gemini 不可假裝已經即時上網搜尋新聞；若 macro_context 提到油價、煉油利差、荷姆茲或航運，只能視為需要驗證的題材假設。",
             "請交叉檢查基本面、法人籌碼、技術面、估值、風險與宏觀題材是否一致。",
             "請避免只因熱門題材就給高信心；若基本面或法人籌碼不支持，請明確標示風險。",
+            "數值為 null 或 margin_data_status=missing 代表資料未提供，不得解讀成 0、虧損或負面風險。",
             "請評估：正向催化、負面風險、成長是否可持續、題材品質、信心分數與一句摘要。",
             "請用繁體中文，避免英文代碼式文字，摘要務必短而清楚。",
             "只回傳 JSON array，每筆包含 stock_id, catalyst, risk, sustainability, theme_quality, confidence, summary。",

@@ -183,6 +183,17 @@ class LineTextTests(unittest.TestCase):
         with patch.dict(os.environ, {"AI_STOCK_ALLOW_INCOMPLETE_DATA_PUSH": "true"}, clear=False):
             bot.assert_three_layer_candidate_pipeline_ready()
 
+    def test_gemini_payload_marks_missing_margins_as_missing_not_zero(self):
+        row = stock("2330", "top", 1)
+        row.update({"gross_margin": 0.0, "operating_margin": 0.0, "net_margin": 0.0})
+
+        payload = bot.compact_for_gemini(row, "top")
+
+        self.assertEqual(payload["margin_data_status"], "missing")
+        self.assertIsNone(payload["gross_margin"])
+        self.assertIsNone(payload["operating_margin"])
+        self.assertIsNone(payload["net_margin"])
+
 
 if __name__ == "__main__":
     unittest.main()
