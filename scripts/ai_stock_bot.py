@@ -5539,11 +5539,13 @@ def assert_three_layer_candidate_pipeline_ready() -> None:
         raise RuntimeError(
             f"Three-layer candidate pipeline incomplete: investable={investable} deep={deep} target={target}"
         )
-    blocking_warnings = {
+    blocking_warning_names = {
         "pool_not_full",
-        "common_trade_date_not_advanced",
         "common_trade_date_missing",
-    } & warnings
+    }
+    if not env_bool("AI_STOCK_ALLOW_INCOMPLETE_DATA_PUSH", False):
+        blocking_warning_names.add("common_trade_date_not_advanced")
+    blocking_warnings = blocking_warning_names & warnings
     if blocking_warnings:
         raise RuntimeError(
             "Three-layer candidate pipeline audit failed: " + ",".join(sorted(blocking_warnings))

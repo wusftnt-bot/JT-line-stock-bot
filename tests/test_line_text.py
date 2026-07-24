@@ -167,6 +167,22 @@ class LineTextTests(unittest.TestCase):
         self.assertEqual(captured["payload"]["messages"][0]["type"], "text")
         self.assertTrue(captured["payload"]["messages"][0]["text"].startswith("[TEST]"))
 
+    def test_manual_latest_data_test_allows_stale_common_trade_date(self):
+        bot.DATA_SOURCE_STATUS.update(
+            {
+                "investable_universe": "investable=922",
+                "preselection": "deep=220 target=220",
+                "candidate_audit": (
+                    "status=warning added=220 removed=0 overlap=0.0% "
+                    "hash=abc trade_date=20260723 identical=0 stale=2 "
+                    "warnings=common_trade_date_not_advanced"
+                ),
+            }
+        )
+
+        with patch.dict(os.environ, {"AI_STOCK_ALLOW_INCOMPLETE_DATA_PUSH": "true"}, clear=False):
+            bot.assert_three_layer_candidate_pipeline_ready()
+
 
 if __name__ == "__main__":
     unittest.main()
