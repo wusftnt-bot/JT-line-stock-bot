@@ -29,7 +29,8 @@ MOPS_FINANCIAL_SUMMARY_CSV_URL = "https://mopsfin.twse.com.tw/opendata/t187ap14_
 MOPS_FINANCIAL_SUMMARY_OTC_CSV_URL = "https://mopsfin.twse.com.tw/opendata/t187ap14_O.csv"
 MOPS_BALANCE_SHEET_CSV_URL = "https://mopsfin.twse.com.tw/opendata/t187ap07_L_ci.csv"
 MOPS_BALANCE_SHEET_OTC_CSV_URL = "https://mopsfin.twse.com.tw/opendata/t187ap07_O_ci.csv"
-TWSE_INCOME_URL = "https://openapi.twse.com.tw/v1/opendata/t187ap06_L_ci"
+MOPS_INCOME_STATEMENT_CSV_URL = "https://mopsfin.twse.com.tw/opendata/t187ap06_L_ci.csv"
+MOPS_INCOME_STATEMENT_OTC_CSV_URL = "https://mopsfin.twse.com.tw/opendata/t187ap06_O_ci.csv"
 TWSE_STOCK_DAY_URL = "https://www.twse.com.tw/exchangeReport/STOCK_DAY"
 TWSE_ALL_MARKET_DAY_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX"
 TWSE_T86_URL = "https://www.twse.com.tw/rwd/zh/fund/T86"
@@ -1413,6 +1414,11 @@ def select_opportunity_stocks(results: list[StockRow], excluded: list[StockRow])
             continue
         if float(row.get("price_change_1d") or 0.0) < -6.0:
             continue
+        if (
+            float(row.get("latest_institutional_net") or 0.0) < 0
+            and float(row.get("recent_2d_institutional_net") or 0.0) < 0
+        ):
+            continue
         if float(row.get("latest_volume") or 0.0) < min_latest_volume:
             continue
         if float(row.get("close") or 0.0) < min_close:
@@ -1555,6 +1561,7 @@ def split_top_and_watchlist(rows: list[StockRow], top_limit: int) -> tuple[list[
         for row in rows
         if row.get("top_quality_pass")
         and row.get("fundamental_floor_pass")
+        and row.get("profitability_data_complete")
         and row.get("entry_timing_pass")
         and float(row.get("total_score") or 0.0) >= min_score
         and not row.get("risk_notes")
@@ -1849,41 +1856,66 @@ def apply_institutional_growth_model(rows: list[StockRow]) -> None:
 
 
 def parse_income_margins() -> dict[str, dict[str, float]]:
+    previous_margins = read_cache("income_margins_raw") or {}
     try:
-        rows = fetch_with_retry(TWSE_INCOME_URL, tries=2, timeout=60)
-    except Exception:
-        return {}
-
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for row in rows if isinstance(rows, list) else []:
-        stock_id = str(row.get("公司代號") or row.get("公司代碼") or row.get("證券代號") or "").strip()
-        if stock_id:
-            grouped.setdefault(stock_id, []).append(row)
+        rows = fetch_mops_csv_rows(MOPS_INCOME_STATEMENT_CSV_URL, "listed")
+        rows += fetch_mops_csv_rows(MOPS_INCOME_STATEMENT_OTC_CSV_URL, "otc")
+    except Exception as error:
+        cached = previous_margins if isinstance(previous_margins, dict) else {}
+        DATA_SOURCE_STATUS["margins"] = (
+            f"MOPS unavailable {type(error).__name__} cache_rows={len(cached)}"
+        )
+        return cached
 
     margins: dict[str, dict[str, float]] = {}
-    for stock_id, items in grouped.items():
-        revenue_values = find_statement_values(items, ["營業收入", "收入總額", "收益"])
-        gross_values = find_statement_values(items, ["營業毛利", "銷貨毛利"])
-        operating_values = find_statement_values(items, ["營業利益", "營業淨利"])
-        net_values = find_statement_values(items, ["本期淨利", "稅後淨利", "淨利"])
-        if not revenue_values:
+    incomplete = 0
+    for row in rows:
+        stock_id = str(row_value_by_keywords(row, ["公司", "代"]) or "").strip()
+        if not stock_id:
             continue
 
-        current_revenue = revenue_values[-1]
-        previous_revenue = revenue_values[-2] if len(revenue_values) >= 2 else 0.0
-        current_gross = gross_values[-1] if gross_values else 0.0
-        previous_gross = gross_values[-2] if len(gross_values) >= 2 else 0.0
-        current_operating = operating_values[-1] if operating_values else 0.0
-        previous_operating = operating_values[-2] if len(operating_values) >= 2 else 0.0
-        current_net = net_values[-1] if net_values else 0.0
-        previous_net = net_values[-2] if len(net_values) >= 2 else 0.0
+        revenue_raw = _income_statement_value(row, ["營業收入", "收入合計", "收益合計"])
+        gross_raw = _income_statement_value(
+            row,
+            ["營業毛利（毛損）淨額", "營業毛利(毛損)淨額", "營業毛利（毛損）", "營業毛利(毛損)"],
+        )
+        operating_raw = _income_statement_value(
+            row,
+            ["營業利益（損失）", "營業利益(損失)", "營業淨利（淨損）", "營業淨利(淨損)"],
+        )
+        net_raw = _income_statement_value(
+            row,
+            ["本期淨利（淨損）", "本期淨利(淨損)", "稅後淨利（淨損）", "稅後淨利(淨損)"],
+        )
+        if revenue_raw in (None, "") or any(
+            value in (None, "") for value in (gross_raw, operating_raw, net_raw)
+        ):
+            incomplete += 1
+            continue
+
+        current_revenue = clean_number(revenue_raw)
+        current_gross = clean_number(gross_raw)
+        current_operating = clean_number(operating_raw)
+        current_net = clean_number(net_raw)
+        if current_revenue == 0:
+            incomplete += 1
+            continue
 
         gross_margin = ratio_percent(current_gross, current_revenue)
         operating_margin = ratio_percent(current_operating, current_revenue)
         net_margin = ratio_percent(current_net, current_revenue)
-        prev_gross_margin = ratio_percent(previous_gross, previous_revenue)
-        prev_operating_margin = ratio_percent(previous_operating, previous_revenue)
-        prev_net_margin = ratio_percent(previous_net, previous_revenue)
+        fiscal_year = str(row_value_by_keywords(row, ["年度"]) or "").strip()
+        fiscal_quarter = str(row_value_by_keywords(row, ["季"]) or "").strip()
+        financial_period = f"{fiscal_year}Q{fiscal_quarter}" if fiscal_year or fiscal_quarter else ""
+        previous = previous_margins.get(stock_id, {}) if isinstance(previous_margins, dict) else {}
+        if str(previous.get("financial_period") or "") != financial_period:
+            prev_gross_margin = clean_number(previous.get("gross_margin"))
+            prev_operating_margin = clean_number(previous.get("operating_margin"))
+            prev_net_margin = clean_number(previous.get("net_margin"))
+        else:
+            prev_gross_margin = clean_number(previous.get("prev_gross_margin"))
+            prev_operating_margin = clean_number(previous.get("prev_operating_margin"))
+            prev_net_margin = clean_number(previous.get("prev_net_margin"))
         triple_margin_up = (
             gross_margin > prev_gross_margin > 0
             and operating_margin > prev_operating_margin > 0
@@ -1898,31 +1930,30 @@ def parse_income_margins() -> dict[str, dict[str, float]]:
             "prev_operating_margin": prev_operating_margin,
             "prev_net_margin": prev_net_margin,
             "triple_margin_up": triple_margin_up,
+            "margin_data_status": "available",
+            "margin_data_source": "MOPS income statement",
+            "financial_period": financial_period,
         }
+    DATA_SOURCE_STATUS["margins"] = (
+        f"MOPS income_statement rows={len(margins)} incomplete={incomplete}"
+    )
+    write_cache("income_margins_raw", margins)
     return margins
+
+
+def _income_statement_value(row: dict[str, Any], labels: list[str]) -> Any:
+    normalized = {normalize_field_name(key): value for key, value in row.items()}
+    for label in labels:
+        key = normalize_field_name(label)
+        if key in normalized:
+            return normalized[key]
+    return None
 
 
 def ratio_percent(numerator: float, denominator: float) -> float:
     if denominator == 0:
         return 0.0
     return round(numerator / denominator * 100, 2)
-
-
-def find_statement_values(items: list[dict[str, Any]], keywords: list[str]) -> list[float]:
-    for row in items:
-        text = " ".join(str(value) for value in row.values())
-        if not any(keyword in text for keyword in keywords):
-            continue
-        values = []
-        for key, value in row.items():
-            key_text = str(key)
-            if any(label in key_text for label in ["代號", "名稱", "會計", "項目", "年度", "季別"]):
-                continue
-            number = clean_number(value)
-            if number != 0:
-                values.append(number)
-        return values
-    return []
 
 
 def calculate_fundamental_pre_score(row: StockRow) -> tuple[float, float, str]:
@@ -2784,6 +2815,18 @@ def audit_candidate_pool(candidates: list[StockRow], universe: list[StockRow]) -
 def enrich_revenue_candidate(row: StockRow, margins: dict[str, dict[str, float]]) -> StockRow:
     enriched = row.copy()
     enriched.update(margins.get(row["stock_id"], {}))
+    industry = str(enriched.get("industry_category") or "")
+    margin_not_applicable = "金融" in industry or "保險" in industry
+    if margin_not_applicable and enriched.get("margin_data_status") != "available":
+        enriched["margin_data_status"] = "not_applicable"
+        enriched["margin_data_source"] = "financial industry"
+    else:
+        enriched.setdefault("margin_data_status", "missing")
+        enriched.setdefault("margin_data_source", "")
+    enriched["profitability_data_complete"] = enriched["margin_data_status"] in {
+        "available",
+        "not_applicable",
+    }
     enriched.setdefault("gross_margin", 0.0)
     enriched.setdefault("operating_margin", 0.0)
     enriched.setdefault("net_margin", 0.0)
@@ -3278,84 +3321,98 @@ def _table_rows(payload: Any, required_field: str) -> list[dict[str, Any]]:
 def fetch_all_market_day(day: datetime.date) -> list[StockRow]:
     date_key = day.strftime("%Y%m%d")
     cached = read_cache(f"all_market_day_{date_key}")
-    if isinstance(cached, list) and cached:
-        return cached
+    cached_rows = cached if isinstance(cached, list) else []
+    cached_markets = {
+        str(row.get("market_type") or "")
+        for row in cached_rows
+        if isinstance(row, dict)
+    }
+    if {"listed", "otc"}.issubset(cached_markets):
+        return cached_rows
 
-    normalized: list[StockRow] = []
-    try:
-        payload = fetch_with_retry(
-            TWSE_ALL_MARKET_DAY_URL,
-            params={"response": "json", "date": date_key, "type": "ALLBUT0999"},
-            tries=1,
-            timeout=25,
-        )
-        for row in _table_rows(payload, "證券代號"):
-            stock_id = str(row.get("證券代號") or "").strip()
-            if not re.fullmatch(r"\d{4}", stock_id):
-                continue
-            close = clean_number(row.get("收盤價"))
-            volume = clean_number(row.get("成交股數"))
-            turnover = clean_number(row.get("成交金額"))
-            if close <= 0 or volume <= 0 or turnover <= 0:
-                continue
-            normalized.append(
-                {
-                    "stock_id": stock_id,
-                    "market_type": "listed",
-                    "date": date_key,
-                    "open": clean_number(row.get("開盤價")),
-                    "high": clean_number(row.get("最高價")),
-                    "low": clean_number(row.get("最低價")),
-                    "close": close,
-                    "volume": volume,
-                    "turnover": turnover,
-                }
+    normalized: list[StockRow] = list(cached_rows)
+    if "listed" not in cached_markets:
+        try:
+            payload = fetch_with_retry(
+                TWSE_ALL_MARKET_DAY_URL,
+                params={"response": "json", "date": date_key, "type": "ALLBUT0999"},
+                tries=3,
+                timeout=30,
             )
-    except Exception:
-        pass
+            for row in _table_rows(payload, "證券代號"):
+                stock_id = str(row.get("證券代號") or "").strip()
+                if not re.fullmatch(r"\d{4}", stock_id):
+                    continue
+                close = clean_number(row.get("收盤價"))
+                volume = clean_number(row.get("成交股數"))
+                turnover = clean_number(row.get("成交金額"))
+                if close <= 0 or volume <= 0 or turnover <= 0:
+                    continue
+                normalized.append(
+                    {
+                        "stock_id": stock_id,
+                        "market_type": "listed",
+                        "date": date_key,
+                        "open": clean_number(row.get("開盤價")),
+                        "high": clean_number(row.get("最高價")),
+                        "low": clean_number(row.get("最低價")),
+                        "close": close,
+                        "volume": volume,
+                        "turnover": turnover,
+                    }
+                )
+        except Exception:
+            pass
 
-    try:
-        payload = fetch_with_retry(
-            TPEX_ALL_MARKET_DAY_URL,
-            params={"date": day.strftime("%Y/%m/%d"), "id": "", "response": "json"},
-            tries=1,
-            timeout=25,
-        )
-        for row in _table_rows(payload, "代號"):
-            stock_id = str(row.get("代號") or "").strip()
-            if not re.fullmatch(r"\d{4}", stock_id):
-                continue
-            close = clean_number(row.get("收盤"))
-            volume = clean_number(row.get("成交股數"))
-            turnover = clean_number(row.get("成交金額(元)"))
-            if close <= 0 or volume <= 0 or turnover <= 0:
-                continue
-            normalized.append(
-                {
-                    "stock_id": stock_id,
-                    "market_type": "otc",
-                    "date": date_key,
-                    "open": clean_number(row.get("開盤")),
-                    "high": clean_number(row.get("最高")),
-                    "low": clean_number(row.get("最低")),
-                    "close": close,
-                    "volume": volume,
-                    "turnover": turnover,
-                }
+    if "otc" not in cached_markets:
+        try:
+            payload = fetch_with_retry(
+                TPEX_ALL_MARKET_DAY_URL,
+                params={"date": day.strftime("%Y/%m/%d"), "id": "", "response": "json"},
+                tries=3,
+                timeout=30,
             )
-    except Exception:
-        pass
+            for row in _table_rows(payload, "代號"):
+                stock_id = str(row.get("代號") or "").strip()
+                if not re.fullmatch(r"\d{4}", stock_id):
+                    continue
+                close = clean_number(row.get("收盤"))
+                volume = clean_number(row.get("成交股數"))
+                turnover = clean_number(row.get("成交金額(元)"))
+                if close <= 0 or volume <= 0 or turnover <= 0:
+                    continue
+                normalized.append(
+                    {
+                        "stock_id": stock_id,
+                        "market_type": "otc",
+                        "date": date_key,
+                        "open": clean_number(row.get("開盤")),
+                        "high": clean_number(row.get("最高")),
+                        "low": clean_number(row.get("最低")),
+                        "close": close,
+                        "volume": volume,
+                        "turnover": turnover,
+                    }
+                )
+        except Exception:
+            pass
 
-    if normalized:
+    deduplicated = {
+        (str(row.get("market_type") or ""), str(row.get("stock_id") or "")): row
+        for row in normalized
+    }
+    normalized = list(deduplicated.values())
+    markets = {str(row.get("market_type") or "") for row in normalized}
+    if {"listed", "otc"}.issubset(markets):
         write_cache(f"all_market_day_{date_key}", normalized)
     return normalized
 
 
 def fetch_all_market_price_history(target_days: int = 65) -> dict[str, list[StockRow]]:
     by_stock: dict[str, list[StockRow]] = {}
-    trading_days = 0
+    trading_dates: dict[str, set[str]] = {"listed": set(), "otc": set()}
     today = datetime.now(TAIPEI_TZ).date()
-    max_calendar_days = max(target_days * 2, 120)
+    max_calendar_days = max(target_days * 3, 150)
     for offset in range(max_calendar_days):
         day = today - timedelta(days=offset)
         if day.weekday() >= 5:
@@ -3363,17 +3420,21 @@ def fetch_all_market_price_history(target_days: int = 65) -> dict[str, list[Stoc
         daily_rows = fetch_all_market_day(day)
         if not daily_rows:
             continue
-        trading_days += 1
         for row in daily_rows:
+            market = str(row.get("market_type") or "")
+            if market in trading_dates:
+                trading_dates[market].add(str(row.get("date") or ""))
             by_stock.setdefault(str(row["stock_id"]), []).append(row)
-        if trading_days >= target_days:
+        if all(len(dates) >= target_days for dates in trading_dates.values()):
             break
         time.sleep(0.03)
 
     for records in by_stock.values():
         records.sort(key=lambda item: str(item.get("date") or ""))
+    listed_days = len(trading_dates["listed"])
+    otc_days = len(trading_dates["otc"])
     DATA_SOURCE_STATUS["price"] = (
-        f"TWSE+TPEx bulk trading_days={trading_days} stocks={len(by_stock)}"
+        f"TWSE+TPEx bulk listed_days={listed_days} otc_days={otc_days} stocks={len(by_stock)}"
         if by_stock
         else "bulk_market_unavailable"
     )
@@ -3500,13 +3561,19 @@ def fetch_tpex_institutional_day(date_key: str) -> list[StockRow]:
 
     day = datetime.strptime(date_key, "%Y%m%d").date()
     roc_date = f"{day.year - 1911:03d}/{day.month:02d}/{day.day:02d}"
-    try:
-        text = request_text(
-            TPEX_INSTITUTIONAL_CSV_URL,
-            params={"l": "zh-tw", "o": "csv", "se": "EW", "t": "D", "d": roc_date},
-            timeout=30,
-        )
-    except Exception:
+    text = ""
+    for attempt in range(1, 4):
+        try:
+            text = request_text(
+                TPEX_INSTITUTIONAL_CSV_URL,
+                params={"l": "zh-tw", "o": "csv", "se": "EW", "t": "D", "d": roc_date},
+                timeout=30,
+            )
+            break
+        except Exception:
+            if attempt < 3:
+                time.sleep(attempt)
+    if not text:
         return []
 
     lines = [line for line in text.splitlines() if line.strip()]
@@ -3550,16 +3617,14 @@ def fetch_institutional_maps() -> dict[str, list[dict[str, float]]]:
             payload = fetch_with_retry(
                 TWSE_T86_URL,
                 params={"response": "json", "date": date, "selectType": "ALLBUT0999"},
-                tries=1,
+                tries=2,
                 timeout=30,
             )
         except Exception:
-            continue
+            payload = {}
         fields = payload.get("fields", []) if isinstance(payload, dict) else []
         data = payload.get("data", []) if isinstance(payload, dict) else []
-        if not fields or not data:
-            continue
-        for values in data:
+        for values in data if fields else []:
             row = dict(zip(fields, values))
             stock_id = str(row.get("證券代號") or row.get("股票代號") or "").strip()
             if not stock_id:
@@ -3956,7 +4021,10 @@ def select_accumulation_radar(results: list[StockRow], top_stocks: list[StockRow
     return candidates[:radar_limit]
 
 
-def build_exit_alerts(results: list[StockRow]) -> list[StockRow]:
+def build_exit_alerts(
+    results: list[StockRow],
+    excluded_ids: set[str] | None = None,
+) -> list[StockRow]:
     tracker = read_cache("strategy_tracker")
     history = tracker.get("history", []) if isinstance(tracker, dict) else []
     if not history:
@@ -3966,6 +4034,7 @@ def build_exit_alerts(results: list[StockRow]) -> list[StockRow]:
     today = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
     current_by_stock = {str(row.get("stock_id")): row for row in results}
     seen: set[str] = set()
+    excluded_ids = excluded_ids or set()
     alerts: list[StockRow] = []
     lookback_days = env_int("AI_STOCK_EXIT_ALERT_LOOKBACK_DAYS", 20)
 
@@ -3975,7 +4044,12 @@ def build_exit_alerts(results: list[StockRow]) -> list[StockRow]:
             continue
         for entry in day_record.get("entries", []):
             stock_id = str(entry.get("stock_id") or "")
-            if not stock_id or stock_id in seen or stock_id not in current_by_stock:
+            if (
+                not stock_id
+                or stock_id in seen
+                or stock_id in excluded_ids
+                or stock_id not in current_by_stock
+            ):
                 continue
             row = current_by_stock[stock_id]
             reasons: list[str] = []
@@ -4244,7 +4318,16 @@ def build_v2_selection() -> tuple[list[StockRow], list[StockRow], list[StockRow]
         row["watch_rank"] = rank
     ranked_for_exclusion = top_stocks + opportunity_stocks + watchlist_stocks
     radar_stocks = select_accumulation_radar(results, ranked_for_exclusion)
-    exit_alerts = build_exit_alerts(results)
+    current_selection_ids = {
+        str(row.get("stock_id") or "")
+        for row in top_stocks + opportunity_stocks + watchlist_stocks + radar_stocks
+    }
+    exit_alerts = build_exit_alerts(results, current_selection_ids)
+    for rank, row in enumerate(exit_alerts, start=1):
+        row["exit_alert_rank"] = rank
+    DATA_SOURCE_STATUS["exit_alerts"] = (
+        f"count={len(exit_alerts)} current_selection_excluded=1"
+    )
     ready, status = check_data_completeness(top_stocks + opportunity_stocks + watchlist_stocks + radar_stocks)
     if not ready:
         DATA_SOURCE_STATUS["data_completeness"] = status
@@ -4885,13 +4968,18 @@ def _line_candidate_sources(row: StockRow, limit: int = 2) -> str:
 
 
 def _line_margin_summary(row: StockRow) -> str:
+    status = str(row.get("margin_data_status") or "")
+    if status == "not_applicable":
+        return "三率不適用金融業"
+    if status != "available":
+        return "三率資料未齊"
     margins = [
         float(row.get("gross_margin") or 0.0),
         float(row.get("operating_margin") or 0.0),
         float(row.get("net_margin") or 0.0),
     ]
     if not any(abs(value) >= 0.01 for value in margins):
-        return "毛/營/淨待補"
+        return "毛/營/淨 0.0/0.0/0.0%"
     return f"毛/營/淨 {margins[0]:.1f}/{margins[1]:.1f}/{margins[2]:.1f}%"
 
 
@@ -4977,7 +5065,7 @@ def build_line_message(
     exit_display = exit_alerts[: env_int("AI_STOCK_LINE_EXIT_DISPLAY_LIMIT", 3)]
 
     lines.append(
-        "正式 Top（3檔）：品質、基本面、進場時機通過，且法人當日未轉賣"
+        f"正式 Top（顯示{len(top_display)}檔）：品質、基本面、三率資料、進場時機通過，且法人當日未轉賣"
         if top_stocks
         else "正式 Top：今日沒有完全通過品質、風險與法人當日方向的標的"
     )
@@ -5003,7 +5091,7 @@ def build_line_message(
         lines.append(f"另有 {len(top_stocks) - len(top_display)} 檔正式 Top 未顯示")
 
     if opportunity_display:
-        lines.extend(["====================", "機會股（3檔）：早期資金與基本面具潛力，尚未通過正式Top全部門檻"])
+        lines.extend(["====================", f"機會股（顯示{len(opportunity_display)}檔）：早期資金與基本面具潛力，尚未通過正式Top全部門檻"])
         for row in opportunity_display:
             lines.extend([
                 f"O{row['opportunity_rank']} {row['stock_id']} {row['stock_name']}｜機會 {row.get('opportunity_score', 0):.1f} / 總分 {row['total_score']:.1f}｜{_readable_theme(row.get('industry_theme'))}｜{_line_candidate_sources(row)}",
@@ -5019,14 +5107,21 @@ def build_line_message(
             lines.append(f"另有 {len(opportunity_stocks) - len(opportunity_display)} 檔機會股未顯示")
 
     if watchlist_display:
-        lines.extend(["====================", "Watchlist（3檔）：分數具潛力，但有明確未通過條件"])
+        lines.extend(["====================", f"Watchlist（顯示{len(watchlist_display)}檔）：分數具潛力，但有明確未通過條件"])
         for row in watchlist_display:
             reason_values = [
                 row.get("top_quality_reason"),
                 row.get("risk_notes", []),
                 row.get("event_risk_reason"),
             ]
-            reason = "；".join(_readable_reason_text(item) for item in reason_values if item)
+            reason_parts: list[str] = []
+            for item in reason_values:
+                if not item:
+                    continue
+                for part in _readable_reason_text(item).replace("；", "、").split("、"):
+                    if part and part not in reason_parts:
+                        reason_parts.append(part)
+            reason = "、".join(reason_parts)
             lines.extend([
                 f"W{row['watch_rank']} {row['stock_id']} {row['stock_name']}｜總 {row['total_score']:.1f}｜{_readable_theme(row.get('industry_theme'))}",
                 f"未通過｜{reason or '觀察'}",
@@ -5040,7 +5135,7 @@ def build_line_message(
     if radar_display:
         lines.extend([
             "====================",
-            "法人建倉雷達（3檔）：Top與機會股之外的早期籌碼觀察",
+            f"法人建倉雷達（顯示{len(radar_display)}檔）：Top與機會股之外的早期籌碼觀察",
         ])
         for row in radar_display:
             quiet = "｜低調建倉" if row.get("quiet_accumulation") else "｜籌碼觀察"
@@ -5060,7 +5155,7 @@ def build_line_message(
     if exit_display:
         lines.extend([
             "====================",
-            "Exit Alert 持股風險追蹤（3檔）：曾入選且今日風險轉弱",
+            f"Exit Alert 持股風險追蹤（顯示{len(exit_display)}檔）：曾入選且今日風險轉弱",
         ])
         for row in exit_display:
             reasons = _readable_reason_text(row.get("exit_alert_reasons"), limit=3)
@@ -5611,12 +5706,7 @@ def push_line_message(message: str) -> None:
 
 
 def compact_for_gemini(row: StockRow, bucket: str) -> dict[str, Any]:
-    margin_fields = ("gross_margin", "operating_margin", "net_margin")
-    margin_values = [row.get(field) for field in margin_fields]
-    margin_data_available = any(
-        value is not None and abs(float(value)) > 1e-9
-        for value in margin_values
-    )
+    margin_data_available = str(row.get("margin_data_status") or "") == "available"
     return {
         "bucket": bucket,
         "stock_id": row.get("stock_id"),
@@ -5666,14 +5756,22 @@ def compact_for_gemini(row: StockRow, bucket: str) -> dict[str, Any]:
 
 
 
-def gemini_prompt(candidates: list[dict[str, Any]]) -> str:
+def gemini_prompt(candidates: list[dict[str, Any]], grounded: bool = False) -> str:
+    source_instruction = (
+        "請使用 Google Search 查核候選公司的最新公告、法說會、產業供需、原物料價格與重大新聞；"
+        "只採用可驗證來源，無法查證時明確寫『外部資訊待查證』。"
+        if grounded
+        else
+        "不可假裝即時上網搜尋；macro_context 只能視為需要驗證的題材假設。"
+    )
     payload = {
         "instructions": [
             "你是台股候選名單覆判助理，只能根據 candidates 內提供的結構化資料與 macro_context 判斷。",
-            "Gemini 不可假裝已經即時上網搜尋新聞；若 macro_context 提到油價、煉油利差、荷姆茲或航運，只能視為需要驗證的題材假設。",
+            source_instruction,
             "請交叉檢查基本面、法人籌碼、技術面、估值、風險與宏觀題材是否一致。",
             "請避免只因熱門題材就給高信心；若基本面或法人籌碼不支持，請明確標示風險。",
             "數值為 null 或 margin_data_status=missing 代表資料未提供，不得解讀成 0、虧損或負面風險。",
+            "每檔至少提出一項具體風險；不可回覆『未見主要風險』或其他空泛文字。",
             "請評估：正向催化、負面風險、成長是否可持續、題材品質、信心分數與一句摘要。",
             "請用繁體中文，避免英文代碼式文字，摘要務必短而清楚。",
             "只回傳 JSON array，每筆包含 stock_id, catalyst, risk, sustainability, theme_quality, confidence, summary。",
@@ -5705,55 +5803,92 @@ def request_gemini_reviews(candidates: list[dict[str, Any]]) -> list[dict[str, A
     if not api_key:
         DATA_SOURCE_STATUS["gemini_review"] = "disabled missing_key"
         return []
-    body = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": gemini_prompt(candidates)}],
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.2,
-            "responseMimeType": "application/json",
-        },
-    }
     timeout = env_int("GEMINI_TIMEOUT_SEC", 30)
+    grounded = env_bool("GEMINI_ENABLE_GOOGLE_SEARCH", False)
+    batch_size = max(1, env_int("GEMINI_BATCH_SIZE", len(candidates) or 1))
     models = [
         model.strip()
         for model in env_str("GEMINI_MODEL_SEQUENCE", env_str("GEMINI_MODEL", "gemini-2.5-flash-lite,gemini-2.5-flash")).split(",")
         if model.strip()
     ]
-    last_error: Exception | None = None
-    for model in models:
-        endpoint = GEMINI_GENERATE_CONTENT_URL.format(model=model)
-        url = f"{endpoint}?{urlencode({'key': api_key})}"
-        request = Request(
-            url,
-            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
+    all_reviews: list[dict[str, Any]] = []
+    failed_batches: list[str] = []
+    used_models: set[str] = set()
+    source_count = 0
+    for start in range(0, len(candidates), batch_size):
+        batch = candidates[start : start + batch_size]
+        body: dict[str, Any] = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": gemini_prompt(batch, grounded=grounded)}],
+                }
+            ],
+            "generationConfig": {"temperature": 0.2},
+        }
+        if grounded:
+            body["tools"] = [{"google_search": {}}]
+        else:
+            body["generationConfig"]["responseMimeType"] = "application/json"
+
+        last_error: Exception | None = None
+        batch_reviews: list[dict[str, Any]] = []
+        for model in models:
+            endpoint = GEMINI_GENERATE_CONTENT_URL.format(model=model)
+            url = f"{endpoint}?{urlencode({'key': api_key})}"
+            request = Request(
+                url,
+                data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            for attempt in range(1, env_int("GEMINI_RETRY", 2) + 1):
+                try:
+                    with urlopen(request, timeout=timeout) as response:
+                        payload = json.loads(response.read().decode("utf-8"))
+                    response_candidate = payload.get("candidates", [{}])[0]
+                    text = (
+                        response_candidate.get("content", {})
+                        .get("parts", [{}])[0]
+                        .get("text", "")
+                    )
+                    batch_reviews = parse_json_array_from_text(text)
+                    metadata = response_candidate.get("groundingMetadata", {})
+                    source_count += len(metadata.get("groundingChunks", []))
+                    used_models.add(model)
+                    break
+                except HTTPError as error:
+                    last_error = RuntimeError(f"model={model} attempt={attempt} http={error.code}")
+                    if error.code not in {429, 500, 502, 503, 504}:
+                        break
+                except Exception as error:
+                    last_error = error
+                time.sleep(2 * attempt)
+            if batch_reviews:
+                break
+        if batch_reviews:
+            all_reviews.extend(batch_reviews)
+        else:
+            error_name = type(last_error).__name__ if last_error else "unknown"
+            failed_batches.append(error_name)
+            print(
+                f"GEMINI_REVIEW_BATCH_FAILED batch={start // batch_size + 1} "
+                f"error={error_name}: {last_error}"
+            )
+
+    if not all_reviews:
+        raise RuntimeError(
+            "Gemini review failed after fallbacks: "
+            + ",".join(failed_batches or ["unknown"])
         )
-        for attempt in range(1, env_int("GEMINI_RETRY", 2) + 1):
-            try:
-                with urlopen(request, timeout=timeout) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-                text = (
-                    payload.get("candidates", [{}])[0]
-                    .get("content", {})
-                    .get("parts", [{}])[0]
-                    .get("text", "")
-                )
-                reviews = parse_json_array_from_text(text)
-                DATA_SOURCE_STATUS["gemini_review"] = f"enabled reviewed={len(reviews)} model={model}"
-                return reviews
-            except HTTPError as error:
-                last_error = RuntimeError(f"model={model} attempt={attempt} http={error.code}")
-                if error.code not in {429, 500, 502, 503, 504}:
-                    raise last_error from error
-            except Exception as error:
-                last_error = error
-            time.sleep(2 * attempt)
-    raise RuntimeError(f"Gemini review failed after fallbacks: {last_error}")
+    mode = "grounded" if grounded else "structured"
+    partial = f" partial={len(failed_batches)}" if failed_batches else ""
+    DATA_SOURCE_STATUS["gemini_review"] = (
+        f"enabled {mode} reviewed={len(all_reviews)} "
+        f"batches={math.ceil(len(candidates) / batch_size)} "
+        f"models={','.join(sorted(used_models))} sources={source_count}{partial}"
+    )
+    return all_reviews
 
 
 def attach_gemini_reviews(
@@ -5791,7 +5926,8 @@ def attach_gemini_reviews(
     try:
         reviews = request_gemini_reviews(candidates)
     except Exception as error:
-        DATA_SOURCE_STATUS["gemini_review"] = f"failed {type(error).__name__}"
+        detail = "timeout" if "timeout" in str(error).lower() else type(error).__name__
+        DATA_SOURCE_STATUS["gemini_review"] = f"failed {detail}"
         print(f"GEMINI_REVIEW_FAILED {type(error).__name__}: {error}")
         return
 
@@ -5967,7 +6103,7 @@ def summarize_free_chip_review(entry: dict[str, Any]) -> dict[str, Any]:
         positives.append("通過品質門檻")
     elif entry.get("top_quality_pass") is False:
         score -= 8
-        reason = str(entry.get("top_quality_reason") or "").replace(",", "、")
+        reason = _review_quality_reason_text(entry, volume_ratio)
         risks.append(f"品質門檻未過{f'：{reason}' if reason else ''}")
 
     if fundamental_score >= 30:
@@ -5981,6 +6117,18 @@ def summarize_free_chip_review(entry: dict[str, Any]) -> dict[str, Any]:
     if macro_catalyst_score >= 3:
         score += 4
         positives.append("宏觀題材與籌碼/價量有共振")
+
+    if str(entry.get("margin_data_status") or "") == "missing":
+        risks.append("財務三率資料未齊，獲利品質待確認")
+    if not risks:
+        if volume_ratio < 0.8:
+            risks.append(f"量比僅{volume_ratio:.2f}x，買盤延續性待確認")
+        elif recent_2d < latest_inst:
+            risks.append("近2日法人動能未同步增強，需防短線買盤反轉")
+        elif price_20d > 12:
+            risks.append(f"20日已上漲{price_20d:.1f}%，進場須防追高")
+        else:
+            risks.append("短期法人買盤可能反轉，需觀察次日量價是否延續")
 
     score = round(clip(score, 0, 100), 1)
     return {
@@ -6009,6 +6157,44 @@ def summarize_free_chip_review(entry: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _review_quality_reason_text(entry: dict[str, Any], volume_ratio: float) -> str:
+    labels: list[str] = []
+    for code in str(entry.get("top_quality_reason") or "").split(","):
+        code = code.strip()
+        if not code:
+            continue
+        if code == "weak_volume_ratio":
+            label = f"量比{volume_ratio:.2f}x，量能偏弱"
+        elif code == "entry_timing_risk":
+            price_20d = entry_float(entry, "entry_price_change_20d", "price_change_20d")
+            label = f"進場時機偏晚（20日漲幅{price_20d:.1f}%）"
+        else:
+            label = REASON_LABELS.get(code, "其他品質條件未通過")
+        if label not in labels:
+            labels.append(label)
+    return "、".join(labels[:4])
+
+
+def rule_review_summary(item: dict[str, Any]) -> str:
+    positives = item.get("positives") or []
+    risks = item.get("risks") or []
+    positive = str(positives[0]) if positives else "正向訊號尚未完整"
+    risk = str(risks[0]) if risks else "仍須觀察量價延續"
+    return f"{positive}；{risk}"[:70]
+
+
+def readable_gemini_status(status: str) -> str:
+    if status.startswith("enabled grounded"):
+        return "已連網覆判"
+    if status.startswith("enabled"):
+        return "已完成"
+    if status.startswith("failed"):
+        return "逾時或暫時不可用，以下採規則覆判"
+    if "missing_key" in status:
+        return "未設定，以下採規則覆判"
+    return "規則覆判"
+
+
 def compact_entry_for_gemini(item: dict[str, Any]) -> dict[str, Any]:
     entry = item.get("entry") if isinstance(item.get("entry"), dict) else {}
     return {
@@ -6034,6 +6220,7 @@ def compact_entry_for_gemini(item: dict[str, Any]) -> dict[str, Any]:
         "accumulated_revenue_yoy": entry.get("acc_yoy"),
         "eps": entry.get("eps"),
         "roe": entry.get("roe"),
+        "margin_data_status": entry.get("margin_data_status"),
         "gross_margin": entry.get("gross_margin"),
         "operating_margin": entry.get("operating_margin"),
         "net_margin": entry.get("net_margin"),
@@ -6068,7 +6255,8 @@ def attach_gemini_reviews_to_review_items(items: list[dict[str, Any]]) -> None:
     try:
         reviews = request_gemini_reviews(candidates)
     except Exception as error:
-        DATA_SOURCE_STATUS["gemini_review"] = f"failed {type(error).__name__}"
+        detail = "timeout" if "timeout" in str(error).lower() else type(error).__name__
+        DATA_SOURCE_STATUS["gemini_review"] = f"failed {detail}"
         print(f"GEMINI_REVIEW_FAILED {type(error).__name__}: {error}")
         return
     by_stock = {str(item.get("stock_id") or ""): item for item in reviews}
@@ -6130,19 +6318,21 @@ def build_branch_report_message() -> str:
         "",
         "說明：針對20:00主推播候選名單，使用既有TWSE/TPEx法人、價量、基本面、估值與風險欄位做第二層覆判；目前不使用FinMind分點資料，也不改主模型分數。",
         "====================",
-        f"覆判名單：{len(review_items)} 檔｜Gemini：{DATA_SOURCE_STATUS.get('gemini_review', 'unknown')}",
+        f"覆判名單：{len(review_items)} 檔｜Gemini：{readable_gemini_status(DATA_SOURCE_STATUS.get('gemini_review', 'unknown'))}",
     ]
 
     for index, item in enumerate(review_items[:limit], start=1):
         positives = "、".join(item.get("positives") or []) or "尚無明顯加分訊號"
-        risks = "、".join(item.get("risks") or []) or "未見主要風險"
+        risks = "、".join(item.get("risks") or [])
         ai_review = item.get("ai_review") if isinstance(item.get("ai_review"), dict) else {}
         ai_summary = str(ai_review.get("summary") or "").strip()
         confidence = ai_review.get("confidence")
         try:
             confidence_text = f"{float(confidence):.0f}/10"
         except (TypeError, ValueError):
-            confidence_text = "未啟用"
+            confidence_text = f"{max(1, min(9, round(float(item['review_score']) / 10))):.0f}/10（規則）"
+        summary_label = "AI摘要" if ai_summary else "規則摘要"
+        summary_text = ai_summary or rule_review_summary(item)
         lines.extend(
             [
                 f"{index}. {item['stock_id']} {item['stock_name']}｜覆判 {item['review_score']:.1f}｜{item['review_grade']}",
@@ -6151,7 +6341,7 @@ def build_branch_report_message() -> str:
                 f"價量：1日 {item['price_1d']:.1f}%｜20日 {item['price_20d']:.1f}%｜量比 {item['volume_ratio']:.2f}x",
                 f"加分：{positives}",
                 f"風險：{risks}",
-                f"AI摘要：{ai_summary if ai_summary else 'Gemini未回傳摘要'}｜信心 {confidence_text}",
+                f"{summary_label}：{summary_text}｜信心 {confidence_text}",
                 f"結論：{item['action']}",
             ]
         )
@@ -6355,6 +6545,9 @@ def write_strategy_tracker(
             "gross_margin": row.get("gross_margin"),
             "operating_margin": row.get("operating_margin"),
             "net_margin": row.get("net_margin"),
+            "margin_data_status": row.get("margin_data_status"),
+            "margin_data_source": row.get("margin_data_source"),
+            "profitability_data_complete": row.get("profitability_data_complete"),
             "pe_ratio": row.get("pe_ratio"),
             "pbr": row.get("pbr"),
             "operating_cash_flow": row.get("operating_cash_flow"),

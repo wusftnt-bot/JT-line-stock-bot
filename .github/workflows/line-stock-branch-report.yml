@@ -25,11 +25,13 @@ jobs:
       LINE_BROADCAST: "false"
       DAILY_FINANCE_REPORT_URL: "https://wusftnt-bot.github.io/daily-finance-report/"
       AI_STOCK_BRANCH_REPORT_LIMIT: "8"
-      AI_STOCK_GEMINI_REVIEW_LIMIT: "5"
+      AI_STOCK_GEMINI_REVIEW_LIMIT: "8"
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       GEMINI_MODEL_SEQUENCE: "gemini-2.5-flash-lite,gemini-2.5-flash"
       GEMINI_RETRY: "1"
-      GEMINI_TIMEOUT_SEC: "20"
+      GEMINI_TIMEOUT_SEC: "60"
+      GEMINI_BATCH_SIZE: "2"
+      GEMINI_ENABLE_GOOGLE_SEARCH: "true"
       AI_STOCK_SUPPRESS_EMPTY_REVIEW_PUSH: "true"
       AI_STOCK_MAX_RUNTIME_SEC: "900"
     steps:

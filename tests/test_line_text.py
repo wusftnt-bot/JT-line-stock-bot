@@ -44,6 +44,8 @@ def stock(stock_id: str, bucket: str, rank: int, *, latest_institutional: float 
         "gross_margin": 30.0,
         "operating_margin": 15.0,
         "net_margin": 12.0,
+        "margin_data_status": "available",
+        "profitability_data_complete": True,
         "pe_ratio": 18.0,
         "pbr": 2.0,
         "roe": 15.0,
@@ -84,6 +86,14 @@ class DummyResponse:
 
     def __exit__(self, exc_type, exc, traceback):
         return False
+
+
+class GeminiResponse(DummyResponse):
+    def __init__(self, payload):
+        self.payload = payload
+
+    def read(self):
+        return json.dumps(self.payload, ensure_ascii=False).encode("utf-8")
 
 
 class LineTextTests(unittest.TestCase):
@@ -127,11 +137,11 @@ class LineTextTests(unittest.TestCase):
 
         for heading in (
             "AI質化摘要（3檔）",
-            "正式 Top（3檔）",
-            "機會股（3檔）",
-            "Watchlist（3檔）",
-            "法人建倉雷達（3檔）",
-            "Exit Alert 持股風險追蹤（3檔）",
+            "正式 Top（顯示3檔）",
+            "機會股（顯示3檔）",
+            "Watchlist（顯示3檔）",
+            "法人建倉雷達（顯示3檔）",
+            "Exit Alert 持股風險追蹤（顯示3檔）",
         ):
             self.assertIn(heading, message)
         self.assertIn("測試公司1001", message)
@@ -185,7 +195,14 @@ class LineTextTests(unittest.TestCase):
 
     def test_gemini_payload_marks_missing_margins_as_missing_not_zero(self):
         row = stock("2330", "top", 1)
-        row.update({"gross_margin": 0.0, "operating_margin": 0.0, "net_margin": 0.0})
+        row.update(
+            {
+                "gross_margin": 0.0,
+                "operating_margin": 0.0,
+                "net_margin": 0.0,
+                "margin_data_status": "missing",
+            }
+        )
 
         payload = bot.compact_for_gemini(row, "top")
 
@@ -193,6 +210,241 @@ class LineTextTests(unittest.TestCase):
         self.assertIsNone(payload["gross_margin"])
         self.assertIsNone(payload["operating_margin"])
         self.assertIsNone(payload["net_margin"])
+
+    def test_income_statement_wide_rows_calculate_margins(self):
+        income_row = {
+            "年度": "115",
+            "季別": "1",
+            "公司代號": "2027",
+            "公司名稱": "大成鋼",
+            "營業收入": "31174326",
+            "營業毛利（毛損）淨額": "8517820",
+            "營業利益（損失）": "5633209",
+            "本期淨利（淨損）": "3512537",
+        }
+        with (
+            patch.object(bot, "read_cache", return_value={}),
+            patch.object(bot, "write_cache"),
+            patch.object(bot, "fetch_mops_csv_rows", side_effect=[[income_row], []]),
+        ):
+            margins = bot.parse_income_margins()
+
+        self.assertEqual(margins["2027"]["margin_data_status"], "available")
+        self.assertAlmostEqual(margins["2027"]["gross_margin"], 27.32)
+        self.assertAlmostEqual(margins["2027"]["operating_margin"], 18.07)
+        self.assertAlmostEqual(margins["2027"]["net_margin"], 11.27)
+
+    def test_formal_top_rejects_missing_profitability_data(self):
+        row = stock("2027", "top", 1)
+        row["profitability_data_complete"] = False
+
+        top, watch = bot.split_top_and_watchlist([row], 10)
+
+        self.assertEqual(top, [])
+        self.assertEqual([item["stock_id"] for item in watch], ["2027"])
+
+    def test_opportunity_rejects_current_and_two_day_institutional_selling(self):
+        row = stock("3706", "opportunity", 1)
+        row.update(
+            {
+                "institutional_10d_sum": 10_000_000,
+                "latest_institutional_net": -1_087_000,
+                "recent_2d_institutional_net": -445_000,
+                "latest_volume": 2_000_000,
+                "close": 85.0,
+                "margin_risk": False,
+                "event_risk_flags": "",
+            }
+        )
+
+        selected = bot.select_opportunity_stocks([row], [])
+
+        self.assertEqual(selected, [])
+
+    def test_review_risks_are_chinese_and_never_claim_no_risk(self):
+        row = stock("2884", "radar", 1)
+        row.update(
+            {
+                "top_quality_pass": False,
+                "top_quality_reason": "weak_volume_ratio,fundamental_floor",
+                "entry_volume_ratio": 0.59,
+            }
+        )
+
+        review = bot.summarize_free_chip_review(row)
+        risk_text = "、".join(review["risks"])
+
+        self.assertIn("量比0.59x，量能偏弱", risk_text)
+        self.assertIn("基本面底線未通過", risk_text)
+        self.assertNotIn("weak_volume_ratio", risk_text)
+        self.assertNotIn("未見主要風險", risk_text)
+
+    def test_branch_report_has_rule_fallback_when_gemini_times_out(self):
+        row = stock("2884", "radar", 1)
+        row.update(
+            {
+                "source": "radar",
+                "top_quality_pass": False,
+                "top_quality_reason": "weak_volume_ratio,fundamental_floor",
+                "entry_volume_ratio": 0.59,
+            }
+        )
+
+        def fail_gemini(items):
+            bot.DATA_SOURCE_STATUS["gemini_review"] = "failed timeout"
+
+        with (
+            patch.object(bot, "today_strategy_entries", return_value=[row]),
+            patch.object(bot, "attach_gemini_reviews_to_review_items", side_effect=fail_gemini),
+        ):
+            message = bot.build_branch_report_message()
+
+        self.assertIn("Gemini：逾時或暫時不可用，以下採規則覆判", message)
+        self.assertIn("規則摘要：", message)
+        self.assertIn("量比0.59x，量能偏弱", message)
+        self.assertNotIn("weak_volume_ratio", message)
+        self.assertNotIn("未見主要風險", message)
+        self.assertNotIn("信心 未啟用", message)
+
+    def test_grounded_gemini_reviews_are_batched(self):
+        requests = []
+
+        def fake_urlopen(request, timeout):
+            requests.append((request, timeout))
+            body = json.loads(request.data.decode("utf-8"))
+            batch = json.loads(body["contents"][0]["parts"][0]["text"])["candidates"]
+            reviews = [
+                {
+                    "stock_id": item["stock_id"],
+                    "summary": "已查核公開資訊",
+                    "risk": "需求與法人買盤可能轉弱",
+                    "confidence": 7,
+                }
+                for item in batch
+            ]
+            return GeminiResponse(
+                {
+                    "candidates": [
+                        {
+                            "content": {"parts": [{"text": json.dumps(reviews, ensure_ascii=False)}]},
+                            "groundingMetadata": {"groundingChunks": [{"web": {"uri": "https://example.com"}}]},
+                        }
+                    ]
+                }
+            )
+
+        candidates = [
+            {"stock_id": "2027", "stock_name": "大成鋼"},
+            {"stock_id": "2317", "stock_name": "鴻海"},
+            {"stock_id": "6214", "stock_name": "精誠"},
+        ]
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "GEMINI_API_KEY": "secret",
+                    "GEMINI_MODEL_SEQUENCE": "gemini-2.5-flash-lite",
+                    "GEMINI_BATCH_SIZE": "2",
+                    "GEMINI_ENABLE_GOOGLE_SEARCH": "true",
+                    "GEMINI_RETRY": "1",
+                },
+                clear=False,
+            ),
+            patch.object(bot, "urlopen", side_effect=fake_urlopen),
+        ):
+            reviews = bot.request_gemini_reviews(candidates)
+
+        self.assertEqual(len(reviews), 3)
+        self.assertEqual(len(requests), 2)
+        for request, _timeout in requests:
+            body = json.loads(request.data.decode("utf-8"))
+            self.assertEqual(body["tools"], [{"google_search": {}}])
+            self.assertNotIn("responseMimeType", body["generationConfig"])
+        self.assertIn("enabled grounded reviewed=3", bot.DATA_SOURCE_STATUS["gemini_review"])
+
+    def test_partial_market_cache_refetches_missing_otc_rows(self):
+        listed = {
+            "stock_id": "2330",
+            "market_type": "listed",
+            "date": "20260727",
+            "close": 1000,
+            "volume": 1_000_000,
+            "turnover": 1_000_000_000,
+        }
+        tpex_payload = {
+            "tables": [
+                {
+                    "fields": ["代號", "開盤", "最高", "最低", "收盤", "成交股數", "成交金額(元)"],
+                    "data": [["6488", "100", "102", "99", "101", "500000", "50500000"]],
+                }
+            ]
+        }
+        with (
+            patch.object(bot, "read_cache", return_value=[listed]),
+            patch.object(bot, "fetch_with_retry", return_value=tpex_payload),
+            patch.object(bot, "write_cache") as write_cache,
+        ):
+            rows = bot.fetch_all_market_day(bot.datetime(2026, 7, 27).date())
+
+        self.assertEqual({row["market_type"] for row in rows}, {"listed", "otc"})
+        write_cache.assert_called_once()
+
+    def test_market_history_waits_for_both_markets(self):
+        calls = []
+
+        def market_day(day):
+            calls.append(day)
+            date_key = day.strftime("%Y%m%d")
+            rows = [
+                {
+                    "stock_id": "2330",
+                    "market_type": "listed",
+                    "date": date_key,
+                    "close": 1000,
+                    "volume": 1_000_000,
+                }
+            ]
+            if len(calls) != 2:
+                rows.append(
+                    {
+                        "stock_id": "6488",
+                        "market_type": "otc",
+                        "date": date_key,
+                        "close": 100,
+                        "volume": 500_000,
+                    }
+                )
+            return rows
+
+        with patch.object(bot, "fetch_all_market_day", side_effect=market_day):
+            history = bot.fetch_all_market_price_history(target_days=2)
+
+        self.assertEqual(len(calls), 3)
+        self.assertGreaterEqual(len(history["6488"]), 2)
+        self.assertIn("listed_days=3 otc_days=2", bot.DATA_SOURCE_STATUS["price"])
+
+    def test_exit_alert_excludes_current_selection(self):
+        current = stock("2317", "opportunity", 1)
+        current.update(
+            {
+                "close": 90,
+                "ma20": 100,
+                "ma60": 110,
+                "prior_institutional_net": -100,
+            }
+        )
+        tracker = {
+            "history": [
+                {
+                    "date": "2026-07-27",
+                    "entries": [{"stock_id": "2317", "source": "opportunity", "entry_close": 95}],
+                }
+            ]
+        }
+        with patch.object(bot, "read_cache", return_value=tracker):
+            alerts = bot.build_exit_alerts([current], excluded_ids={"2317"})
+
+        self.assertEqual(alerts, [])
 
 
 if __name__ == "__main__":
