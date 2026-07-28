@@ -2,6 +2,31 @@ name: line-stock-ai-review
 
 on:
   workflow_dispatch:
+    inputs:
+      allow_latest_available_data:
+        description: "Manual test only: use the latest primary selection cache."
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      mark_sent:
+        description: "Save the official daily sent marker after a manual push."
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      line_test_push:
+        description: "Prefix the manually dispatched LINE message with [TEST]."
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
   schedule:
     # 21:10-21:55 Asia/Taipei retries, Monday-Friday. GitHub Actions schedules use UTC.
     # If the 20:00 primary analysis finishes late, later slots can still send the AI review.
@@ -32,8 +57,10 @@ jobs:
       GEMINI_TIMEOUT_SEC: "60"
       GEMINI_BATCH_SIZE: "2"
       GEMINI_ENABLE_GOOGLE_SEARCH: "true"
+      AI_STOCK_BRANCH_ALLOW_LATEST_DATA: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_latest_available_data == 'true' && 'true' || 'false' }}
       AI_STOCK_SUPPRESS_EMPTY_REVIEW_PUSH: "true"
       AI_STOCK_MAX_RUNTIME_SEC: "900"
+      LINE_TEST_PUSH: ${{ github.event_name == 'workflow_dispatch' && inputs.line_test_push == 'true' && 'true' || 'false' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,6 +76,11 @@ jobs:
           echo "sent_marker=.sent/line/line-stock-ai-review-$today.txt" >> "$GITHUB_OUTPUT"
           echo "sent_cache_key=line-stock-ai-review-$today" >> "$GITHUB_OUTPUT"
           echo "data_cache_prefix=ai-stock-data-cache-" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ inputs.mark_sent || 'false' }}" = "true" ]; then
+            echo "should_mark_sent=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_mark_sent=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Guard scheduled AI review window
         id: push-window
@@ -75,7 +107,10 @@ jobs:
         if: steps.push-window.outputs.allowed == 'true'
         shell: bash
         run: |
-          if [ "${{ steps.sent-cache.outputs.cache-hit }}" = "true" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.line_test_push || 'false' }}" = "true" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "Manual test bypasses the official sent marker."
+          elif [ "${{ steps.sent-cache.outputs.cache-hit }}" = "true" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "LINE AI review already sent today via cache marker."
           else
@@ -119,7 +154,7 @@ jobs:
           echo "AI_STOCK_REVIEW_WORKFLOW_RUNTIME elapsed_seconds=$elapsed"
 
       - name: Create AI review sent marker
-        if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true' && steps.review.outputs.has_entries == 'true'
+        if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true' && steps.review.outputs.has_entries == 'true' && steps.taipei.outputs.should_mark_sent == 'true'
         shell: bash
         run: |
           mkdir -p "$(dirname "${{ steps.taipei.outputs.sent_marker }}")"
@@ -132,7 +167,7 @@ jobs:
           } > "${{ steps.taipei.outputs.sent_marker }}"
 
       - name: Save AI review sent marker
-        if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true' && steps.review.outputs.has_entries == 'true'
+        if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true' && steps.review.outputs.has_entries == 'true' && steps.taipei.outputs.should_mark_sent == 'true'
         uses: actions/cache/save@v4
         continue-on-error: true
         with:

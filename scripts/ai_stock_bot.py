@@ -6284,7 +6284,14 @@ def today_strategy_entries() -> list[dict[str, Any]]:
     for day_record in reversed(history):
         if str(day_record.get("date") or "") == today:
             entries = day_record.get("entries", [])
+            DATA_SOURCE_STATUS["branch_source_date"] = today
             return [entry for entry in entries if isinstance(entry, dict)]
+    if env_bool("AI_STOCK_BRANCH_ALLOW_LATEST_DATA", False):
+        for day_record in reversed(history):
+            entries = day_record.get("entries", [])
+            if entries:
+                DATA_SOURCE_STATUS["branch_source_date"] = str(day_record.get("date") or "latest")
+                return [entry for entry in entries if isinstance(entry, dict)]
     return []
 
 
@@ -6316,7 +6323,10 @@ def build_branch_report_message() -> str:
         "AI Stock Bot V2 AI覆判與籌碼風險檢查",
         f"完整財經看板：{DAILY_FINANCE_REPORT_URL}",
         "",
-        "說明：針對20:00主推播候選名單，使用既有TWSE/TPEx法人、價量、基本面、估值與風險欄位做第二層覆判；目前不使用FinMind分點資料，也不改主模型分數。",
+        (
+            "說明：針對20:00主推播候選名單，使用TWSE/TPEx、財務、估值與Google Search"
+            f"做第二層覆判；資料日 {DATA_SOURCE_STATUS.get('branch_source_date', '待確認')}，不改主模型分數。"
+        ),
         "====================",
         f"覆判名單：{len(review_items)} 檔｜Gemini：{readable_gemini_status(DATA_SOURCE_STATUS.get('gemini_review', 'unknown'))}",
     ]
