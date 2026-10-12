@@ -22,8 +22,10 @@ from urllib.request import Request, urlopen
 
 try:
     from scripts.market_calendar import expected_trade_date, is_trading_day
+    from scripts.financial_metrics import canonical_period, financial_period, update_period_history, derive_financial_metrics, fill_valuation_estimates, number
 except ModuleNotFoundError:
     from market_calendar import expected_trade_date, is_trading_day
+    from financial_metrics import canonical_period, financial_period, update_period_history, derive_financial_metrics, fill_valuation_estimates, number
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -191,6 +193,17 @@ KEEP_COLS = [
     "liabilities",
     "debt_ratio",
     "financial_period",
+    "eps_basis",
+    "eps_comparison_basis",
+    "eps_comparison_available",
+    "annualized_eps",
+    "eps_ttm",
+    "eps_ttm_basis",
+    "book_value_per_share",
+    "roe_basis",
+    "per_source",
+    "pbr_source",
+    "valuation_trade_date",
     "roe",
     "pe_ratio",
     "pbr",
@@ -632,32 +645,56 @@ def fetch_finmind_per_record(stock_id: str, days: int = 45) -> dict[str, float]:
         "pe_ratio": clean_number(latest.get("PER") or latest.get("pe") or latest.get("price_earning_ratio")),
         "pbr": clean_number(latest.get("PBR") or latest.get("pbr") or latest.get("price_book_ratio")),
         "valuation_source": "FinMind",
+        "per_source": "FinMind",
+        "pbr_source": "FinMind",
+        "valuation_trade_date": normalize_market_date(latest.get("date")),
     }
 
 
-def fill_fallback_valuation(row: StockRow) -> bool:
-    pe_ratio = float(row.get("pe_ratio") or 0.0)
-    pbr = float(row.get("pbr") or 0.0)
-    close = float(row.get("close") or 0.0)
-    eps = float(row.get("eps") or 0.0)
-    roe = float(row.get("roe") or 0.0)
-    changed = False
+def fetch_official_valuation_map(trade_date: str) -> dict[str, StockRow]:
+    cached = read_cache(f"official_valuation_{trade_date}")
+    values = dict(cached) if isinstance(cached, dict) else {}
+    failures = []
+    for label, url, code_field, pe_field, pb_field in (
+        ("TWSE", "https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_d", "Code", "PEratio", "PBratio"),
+        ("TPEx", "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", "SecuritiesCompanyCode", "PriceEarningRatio", "PriceBookRatio"),
+    ):
+        try:
+            rows = fetch_with_retry(url, tries=2, timeout=25)
+            if not isinstance(rows, list):
+                raise ValueError("Official valuation schema is not a list")
+            matched = 0
+            for item in rows:
+                if normalize_market_date(item.get("Date")) != trade_date:
+                    continue
+                if code_field not in item or pe_field not in item or pb_field not in item:
+                    raise ValueError("Official valuation columns missing")
+                sid = str(item[code_field]).strip()
+                if not re.fullmatch(r"\d{4}", sid):
+                    continue
+                pe, pb = number(item[pe_field]), number(item[pb_field])
+                values[sid] = {
+                    "pe_ratio": pe if pe is not None and pe > 0 else None,
+                    "pbr": pb if pb is not None and pb > 0 else None,
+                    "per_source": label if pe is not None and pe > 0 else "",
+                    "pbr_source": label if pb is not None and pb > 0 else "",
+                    "official_per_missing": pe is None or pe <= 0,
+                    "pe_ratio_estimated": False,
+                    "valuation_source": label, "valuation_trade_date": trade_date,
+                }
+                matched += 1
+            if not matched:
+                failures.append(f"{label}_date_not_ready")
+        except Exception as error:
+            failures.append(f"{label}_{type(error).__name__}")
+    if values:
+        write_cache(f"official_valuation_{trade_date}", values)
+    DATA_SOURCE_STATUS["official_valuation"] = f"rows={len(values)} date={trade_date} failures={','.join(failures) or 'none'}"
+    return values
 
-    if pe_ratio <= 0 and close > 0 and eps > 0:
-        annualized_eps = eps * env_float("AI_STOCK_VALUATION_EPS_ANNUALIZE_FACTOR", 4.0)
-        if annualized_eps > 0:
-            pe_ratio = close / annualized_eps
-            row["pe_ratio"] = round(pe_ratio, 2)
-            changed = True
-    if pbr <= 0 and pe_ratio > 0 and roe > 0:
-        pbr = pe_ratio * roe / 100
-        row["pbr"] = round(pbr, 2)
-        changed = True
-    if changed:
-        row["valuation_source"] = str(row.get("valuation_source") or "MOPS_EPS_ROE_FALLBACK")
-    elif pe_ratio > 0 or pbr > 0:
-        row["valuation_source"] = str(row.get("valuation_source") or "provided")
-    return changed
+
+def fill_fallback_valuation(row: StockRow) -> bool:
+    return fill_valuation_estimates(row)
 
 
 def fetch_finmind_cash_flow_record(stock_id: str, days: int = 430) -> dict[str, float]:
@@ -870,8 +907,35 @@ def row_value_by_keywords(row: dict[str, Any], keywords: list[str]) -> Any:
     return None
 
 
-def fetch_mops_financial_quality_map() -> dict[str, dict[str, float]]:
+def fetch_financial_sector_balances() -> list[StockRow]:
+    rows = []
+    failures = []
+    for suffix in ("bd", "basi", "fh", "ins", "mim"):
+        key = f"financial_sector_balance_{suffix}"
+        cache = read_cache_record(key)
+        cached = cache.get("payload") if isinstance(cache, dict) else None
+        age = cache_age_hours(cache)
+        if isinstance(cached, list) and age is not None and age < 24:
+            rows.extend(cached)
+            continue
+        try:
+            data = request_json(f"https://openapi.twse.com.tw/v1/opendata/t187ap07_L_{suffix}", timeout=15)
+            if not isinstance(data, list) or any("公司代號" not in item for item in data):
+                raise ValueError("Financial-sector balance schema mismatch")
+            write_cache(key, data)
+            rows.extend(data)
+        except Exception as error:
+            failures.append(f"{suffix}_{type(error).__name__}")
+            if isinstance(cached, list):
+                rows.extend(cached)
+    DATA_SOURCE_STATUS["financial_sector_balance"] = f"rows={len(rows)} failures={','.join(failures) or 'none'}"
+    return rows
+
+
+def fetch_mops_financial_quality_map() -> dict[str, StockRow]:
     previous_quality = read_cache("financial_quality_raw") or {}
+    ledger = read_cache("financial_period_history") or {}
+    income_map = read_cache("income_margins_raw") or {}
     try:
         summary_rows = fetch_mops_csv_rows(MOPS_FINANCIAL_SUMMARY_CSV_URL, "listed") + fetch_mops_csv_rows(
             MOPS_FINANCIAL_SUMMARY_OTC_CSV_URL,
@@ -883,21 +947,21 @@ def fetch_mops_financial_quality_map() -> dict[str, dict[str, float]]:
         )
     except Exception as error:
         DATA_SOURCE_STATUS["financial_quality"] = f"MOPS unavailable {type(error).__name__}"
-        return {}
+        return {sid: record for sid, record in previous_quality.items() if isinstance(record, dict) and record.get("financial_metrics_version") == 2}
 
     balance_by_stock: dict[str, dict[str, Any]] = {}
-    for row in balance_rows:
+    for row in balance_rows + fetch_financial_sector_balances():
         stock_id = str(row_value_by_keywords(row, ["公司", "代"]) or "").strip()
         if stock_id:
             balance_by_stock[stock_id] = row
 
-    quality: dict[str, dict[str, float]] = {}
+    raw_quality: dict[str, StockRow] = {}
     for row in summary_rows:
         stock_id = str(row_value_by_keywords(row, ["公司", "代"]) or "").strip()
         if not stock_id:
             continue
-        net_income = clean_number(row_value_by_keywords(row, ["稅", "淨", "利"]))
-        eps = clean_number(row_value_by_keywords(row, ["每股", "盈"]))
+        net_income = number(row_value_by_keywords(row, ["稅", "淨", "利"]))
+        eps = number(row_value_by_keywords(row, ["每股", "盈"]))
         fiscal_year = str(
             row_value_by_keywords(row, ["資料", "年度"])
             or row_value_by_keywords(row, ["年度"])
@@ -907,38 +971,41 @@ def fetch_mops_financial_quality_map() -> dict[str, dict[str, float]]:
             row_value_by_keywords(row, ["季"])
             or ""
         ).strip()
-        financial_period = f"{fiscal_year}Q{fiscal_quarter}" if fiscal_year or fiscal_quarter else ""
+        period = financial_period(fiscal_year, fiscal_quarter)
         balance = balance_by_stock.get(stock_id, {})
-        equity = clean_number(row_value_by_keywords(balance, ["權益", "總計"]))
-        assets = clean_number(row_value_by_keywords(balance, ["資產", "總計"]))
-        liabilities = clean_number(row_value_by_keywords(balance, ["負債", "總計"]))
-        debt_ratio = round(liabilities / assets * 100, 2) if assets > 0 else 0.0
-        roe = round(net_income * 4 / equity * 100, 2) if equity > 0 else 0.0
-        previous = previous_quality.get(stock_id, {}) if isinstance(previous_quality, dict) else {}
-        previous_period = str(previous.get("financial_period") or "") if isinstance(previous, dict) else ""
-        previous_eps = (
-            clean_number(previous.get("eps"))
-            if isinstance(previous, dict)
-            and previous_period
-            and financial_period
-            and previous_period != financial_period
-            else 0.0
-        )
-        eps_change_pct = ((eps / previous_eps) - 1) * 100 if previous_eps > 0 and eps != previous_eps else 0.0
-        quality[stock_id] = {
+        balance_period = financial_period(row_value_by_keywords(balance, ["年度"]), row_value_by_keywords(balance, ["季"]))
+        if not period or balance_period != period:
+            balance = {}
+        equity = number(balance.get("權益總計"))
+        parent_equity = number(row_value_by_keywords(balance, ["歸屬", "母公司", "權益", "合計"]))
+        assets = number(row_value_by_keywords(balance, ["資產", "總"]))
+        liabilities = number(row_value_by_keywords(balance, ["負債", "總"]))
+        debt_ratio = round(liabilities / assets * 100, 2) if liabilities is not None and assets is not None and assets > 0 else None
+        income = income_map.get(stock_id, {})
+        owner_income = income.get("owner_net_income") if canonical_period(income.get("financial_period")) == period else None
+        raw_quality[stock_id] = {
             "eps": eps,
-            "previous_eps": previous_eps,
-            "eps_change_pct": round(eps_change_pct, 2),
             "net_income": net_income,
+            "owner_net_income": owner_income,
             "equity": equity,
-            "roe": roe,
+            "parent_equity": parent_equity,
             "assets": assets,
             "liabilities": liabilities,
             "debt_ratio": debt_ratio,
-            "financial_period": financial_period,
+            "debt_ratio_applicable": not any(word in str(row.get("產業別") or "") for word in ("金融", "銀行", "金控", "保險", "證券")),
+            "book_value_per_share": number(balance.get("每股參考淨值")),
+            "financial_period": period,
+            "financial_basis": "ytd",
+            "balance_period_aligned": bool(balance),
+            "source_export_date": str(row.get("出表日期") or ""),
+            "financial_metrics_version": 2,
         }
 
-    DATA_SOURCE_STATUS["financial_quality"] = f"MOPS EPS/ROE rows={len(quality)}"
+    ledger = update_period_history(ledger, previous_quality, raw_quality)
+    quality = {sid: derive_financial_metrics(record, ledger["stocks"].get(sid, {})) for sid, record in raw_quality.items()}
+    comparison_count = sum(bool(row.get("eps_comparison_available")) for row in quality.values())
+    DATA_SOURCE_STATUS["financial_quality"] = f"MOPS EPS/ROE rows={len(quality)} eps_yoy={comparison_count}"
+    write_cache("financial_period_history", ledger)
     write_cache("financial_quality_raw", quality)
     return quality
 
@@ -1642,7 +1709,9 @@ def calculate_eps_acceleration_score(row: StockRow) -> tuple[float, str]:
     notes: list[str] = []
     score = 0.0
 
-    if previous_eps > 0 and eps > 0 and eps_change_pct:
+    if not row.get("eps_comparison_available"):
+        return 0.0, "eps_comparison_missing"
+    if previous_eps > 0 and eps_change_pct:
         if eps_change_pct >= 80:
             score += 5
             notes.append("eps_accel_strong")
@@ -1652,9 +1721,9 @@ def calculate_eps_acceleration_score(row: StockRow) -> tuple[float, str]:
         elif eps_change_pct <= -30:
             score -= 3
             notes.append("eps_deceleration")
-    elif eps > 0 and yoy >= 30 and acc_yoy >= 20:
-        score += 1
-        notes.append("eps_positive_revenue_proxy")
+    elif row.get("eps_turnaround_confirmed"):
+        score += 3
+        notes.append("eps_yoy_turnaround")
     elif eps < 0 and yoy < 40:
         score -= 2
         notes.append("eps_loss_no_growth")
@@ -1674,13 +1743,15 @@ def calculate_fundamental_v2_score(row: StockRow) -> float:
     row["cash_flow_quality"] = cash_flow_quality
 
     quality_score = 0.0
-    has_financial_quality_data = any(key in row for key in ("eps", "roe", "net_income"))
+    has_financial_quality_data = any(row.get(key) is not None for key in ("eps", "roe", "net_income"))
     if not has_financial_quality_data:
         quality_score += env_float("AI_STOCK_FINANCIAL_NEUTRAL_SCORE", 6.0)
         row["financial_quality_note"] = "financial_neutral_missing"
     if eps > 0:
         quality_score += 2
-    if eps >= 2:
+    period = canonical_period(row.get("financial_period"))
+    eps_level = eps / int(period[-1]) if row.get("eps_basis") == "ytd" and period else eps
+    if eps_level >= 2:
         quality_score += 2
     if net_income > 0:
         quality_score += 1
@@ -1842,7 +1913,7 @@ def apply_institutional_growth_model(rows: list[StockRow]) -> None:
         )
         grade = model_grade(total_score)
 
-        row["model_version"] = "V2.3 Multi-pool Early Rotation"
+        row["model_version"] = "V2.4 Verified Financial Periods"
         row["legacy_score"] = round(legacy_score, 2)
         row["fundamental_score"] = round(fundamental_weighted, 2)
         row["chip_score"] = round(chip_weighted, 2)
@@ -1918,12 +1989,15 @@ def parse_income_margins() -> dict[str, dict[str, float]]:
             prev_gross_margin = clean_number(previous.get("gross_margin"))
             prev_operating_margin = clean_number(previous.get("operating_margin"))
             prev_net_margin = clean_number(previous.get("net_margin"))
+            margin_comparison_available = bool(previous.get("financial_period")) and previous.get("margin_data_status") == "available"
         else:
             prev_gross_margin = clean_number(previous.get("prev_gross_margin"))
             prev_operating_margin = clean_number(previous.get("prev_operating_margin"))
             prev_net_margin = clean_number(previous.get("prev_net_margin"))
+            margin_comparison_available = bool(previous.get("margin_comparison_available"))
         triple_margin_up = (
-            gross_margin > prev_gross_margin > 0
+            margin_comparison_available
+            and gross_margin > prev_gross_margin > 0
             and operating_margin > prev_operating_margin > 0
             and net_margin > prev_net_margin > 0
         )
@@ -1936,9 +2010,11 @@ def parse_income_margins() -> dict[str, dict[str, float]]:
             "prev_operating_margin": prev_operating_margin,
             "prev_net_margin": prev_net_margin,
             "triple_margin_up": triple_margin_up,
+            "margin_comparison_available": margin_comparison_available,
             "margin_data_status": "available",
             "margin_data_source": "MOPS income statement",
             "financial_period": financial_period,
+            "owner_net_income": number(_income_statement_value(row, ["淨利（淨損）歸屬於母公司業主", "淨利(淨損)歸屬於母公司業主"])),
         }
     DATA_SOURCE_STATUS["margins"] = (
         f"MOPS income_statement rows={len(margins)} incomplete={incomplete}"
@@ -1974,9 +2050,7 @@ def calculate_fundamental_pre_score(row: StockRow) -> tuple[float, float, str]:
     operating_margin = float(row.get("operating_margin") or 0.0)
     net_margin = float(row.get("net_margin") or 0.0)
     debt_ratio = float(row.get("debt_ratio") or 0.0)
-    financial_available = any(
-        key in row for key in ("eps", "roe", "net_income", "equity")
-    )
+    financial_available = any(row.get(key) is not None for key in ("eps", "roe", "net_income", "equity"))
 
     revenue_score = (
         clip((yoy + 10) / 60 * 8, 0, 8)
@@ -1989,10 +2063,10 @@ def calculate_fundamental_pre_score(row: StockRow) -> tuple[float, float, str]:
     if financial_available:
         if eps > 0:
             quality_score += 3
-        if previous_eps > 0 and eps_change >= 30:
+        if row.get("eps_comparison_available") and previous_eps > 0 and eps_change >= 30:
             quality_score += 4
             notes.append("eps_accelerating")
-        elif previous_eps > 0 and eps_change <= -30:
+        elif row.get("eps_comparison_available") and previous_eps > 0 and eps_change <= -30:
             quality_score -= 2
             notes.append("eps_decelerating")
         if roe >= 15:
@@ -2004,7 +2078,7 @@ def calculate_fundamental_pre_score(row: StockRow) -> tuple[float, float, str]:
         if row.get("triple_margin_up"):
             quality_score += 3
             notes.append("margins_improving")
-        if debt_ratio:
+        if row.get("debt_ratio") is not None and row.get("debt_ratio_applicable", True):
             quality_score += 2 if debt_ratio <= 50 else 1 if debt_ratio <= 65 else -1
     else:
         quality_score += 5
@@ -2019,13 +2093,13 @@ def calculate_fundamental_pre_score(row: StockRow) -> tuple[float, float, str]:
         turn_score += 5
     if mom > 5 and yoy > 0:
         turn_score += 3
-    if previous_eps > 0 and eps_change >= 30:
+    if row.get("eps_comparison_available") and previous_eps > 0 and eps_change >= 30:
         turn_score += 6
-    elif previous_eps <= 0 < eps:
+    elif row.get("eps_turnaround_confirmed"):
         turn_score += 7
     if row.get("triple_margin_up"):
         turn_score += 5
-    if operating_margin > float(row.get("prev_operating_margin") or 0.0) and operating_margin > 0:
+    if row.get("margin_comparison_available") and operating_margin > float(row.get("prev_operating_margin") or 0) and operating_margin > 0:
         turn_score += 3
     return score, round(clip(turn_score, 0, 20), 2), ",".join(notes) or "available"
 
@@ -4217,6 +4291,8 @@ def build_v2_selection() -> tuple[list[StockRow], list[StockRow], list[StockRow]
         non_mainstream_breakouts,
     )
     margin_map = fetch_margin_map()
+    valuation_date = normalize_market_date(candidates[0].get("aligned_trade_date")) if candidates else ""
+    official_valuation = fetch_official_valuation_map(valuation_date) if valuation_date else {}
     top_limit = env_int("AI_STOCK_TOP_LIMIT", 10)
     finmind_fundamental_limit = env_int("AI_STOCK_FINMIND_FUNDAMENTAL_LIMIT", 25)
     finmind_valuation_count = 0
@@ -4241,9 +4317,14 @@ def build_v2_selection() -> tuple[list[StockRow], list[StockRow], list[StockRow]
                 if records
                 else calculate_technical_score(enriched["stock_id"])
             )
+        official_record = official_valuation.get(enriched["stock_id"])
+        if official_record:
+            enriched.update(official_record)
         if index < finmind_fundamental_limit:
             try:
-                valuation_record = fetch_finmind_per_record(enriched["stock_id"])
+                valuation_record = fetch_finmind_per_record(enriched["stock_id"]) if not official_record else {}
+                if valuation_record.get("valuation_trade_date") != normalize_market_date(enriched.get("aligned_trade_date")):
+                    valuation_record = {}
                 if valuation_record:
                     enriched.update(valuation_record)
                     if float(enriched.get("pe_ratio") or 0.0) > 0 or float(enriched.get("pbr") or 0.0) > 0:
@@ -4278,9 +4359,10 @@ def build_v2_selection() -> tuple[list[StockRow], list[StockRow], list[StockRow]
         enriched.update(calculate_chip_score(enriched["stock_id"], institutional))
         enriched.update(calculate_accumulation_score(enriched, institutional, margin_map))
         results.append(enriched)
-    if finmind_valuation_count or fallback_valuation_count:
+    official_count = sum(row.get("per_source") in {"TWSE", "TPEx"} or row.get("pbr_source") in {"TWSE", "TPEx"} for row in results)
+    if official_count or finmind_valuation_count or fallback_valuation_count:
         DATA_SOURCE_STATUS["valuation"] = (
-            f"FinMind PER/PBR rows={finmind_valuation_count} "
+            f"official={official_count} FinMind PER/PBR rows={finmind_valuation_count} "
             f"fallback_mops={fallback_valuation_count}"
         )
     else:
@@ -4290,6 +4372,20 @@ def build_v2_selection() -> tuple[list[StockRow], list[StockRow], list[StockRow]
         if finmind_cash_flow_count
         else "neutral_no_cashflow_source"
     )
+    financial_health = {
+        "candidates": len(results),
+        "official_valuation": official_count,
+        "estimated_per": sum(bool(row.get("pe_ratio_estimated")) for row in results),
+        "per_missing": sum(not row.get("pe_ratio") for row in results),
+        "official_per_unavailable": sum(bool(row.get("official_per_missing")) for row in results),
+        "valuation_both_missing": sum(not row.get("pe_ratio") and not row.get("pbr") for row in results),
+        "pbr_missing": sum(not row.get("pbr") for row in results),
+        "eps_same_period_available": sum(bool(row.get("eps_comparison_available")) for row in results),
+        "roe_missing": sum(row.get("roe") is None for row in results),
+        "roe_estimated": sum(str(row.get("roe_basis") or "").endswith("estimate") for row in results),
+    }
+    write_cache("financial_health_latest", financial_health)
+    print("AI_STOCK_FINANCIAL_HEALTH " + json.dumps(financial_health, ensure_ascii=False))
 
     apply_industry_relative_strength(results)
     for row in results:
@@ -5004,11 +5100,13 @@ def _line_valuation_summary(row: StockRow) -> str:
     roe = float(row.get("roe") or 0.0)
     values = []
     if pe > 0:
-        values.append(f"PER {pe:.1f}")
+        values.append(f"PER{'估' if row.get('pe_ratio_estimated') else ''} {pe:.1f}")
     if pbr > 0:
-        values.append(f"PBR {pbr:.1f}")
-    if roe:
-        values.append(f"ROE {roe:.1f}%")
+        values.append(f"PBR{'算' if row.get('pbr_source') == 'MOPS_BVPS' else ''} {pbr:.1f}")
+    if row.get("roe") is not None:
+        values.append(f"ROE{'估' if str(row.get('roe_basis') or '').endswith('estimate') else ''} {roe:.1f}%")
+    if row.get("financial_period"):
+        values.append(str(row["financial_period"]) + "累計")
     return "/".join(values) if values else "估值來源待補"
 
 
@@ -5796,7 +5894,13 @@ def compact_for_gemini(row: StockRow, bucket: str) -> dict[str, Any]:
         "monthly_revenue_mom": row.get("mom"),
         "accumulated_revenue_yoy": row.get("acc_yoy"),
         "eps": row.get("eps"),
+        "eps_basis": row.get("eps_basis"),
+        "financial_period": row.get("financial_period"),
+        "eps_comparison_basis": row.get("eps_comparison_basis"),
+        "eps_comparison_available": row.get("eps_comparison_available"),
         "roe": row.get("roe"),
+        "roe_basis": row.get("roe_basis"),
+        "pe_ratio_estimated": row.get("pe_ratio_estimated"),
         "margin_data_status": "available" if margin_data_available else "missing",
         "gross_margin": row.get("gross_margin") if margin_data_available else None,
         "operating_margin": row.get("operating_margin") if margin_data_available else None,
@@ -5835,6 +5939,7 @@ def gemini_prompt(candidates: list[dict[str, Any]], grounded: bool = False) -> s
             "請交叉檢查基本面、法人籌碼、技術面、估值、風險與宏觀題材是否一致。",
             "請避免只因熱門題材就給高信心；若基本面或法人籌碼不支持，請明確標示風險。",
             "數值為 null 或 margin_data_status=missing 代表資料未提供，不得解讀成 0、虧損或負面風險。",
+            "eps_basis=ytd 代表當年累計EPS，不可當成單季EPS；EPS同期比較不足時不得宣稱加速或轉虧為盈。roe_basis帶estimate或pe_ratio_estimated=true代表估算，不是公司獲利預測。",
             "每檔至少提出一項具體風險；不可回覆『未見主要風險』或其他空泛文字。",
             "請評估：正向催化、負面風險、成長是否可持續、題材品質、信心分數與一句摘要。",
             "請用繁體中文，避免英文代碼式文字，摘要務必短而清楚。",
@@ -6283,7 +6388,13 @@ def compact_entry_for_gemini(item: dict[str, Any]) -> dict[str, Any]:
         "monthly_revenue_mom": entry.get("mom"),
         "accumulated_revenue_yoy": entry.get("acc_yoy"),
         "eps": entry.get("eps"),
+        "eps_basis": entry.get("eps_basis"),
+        "financial_period": entry.get("financial_period"),
+        "eps_comparison_basis": entry.get("eps_comparison_basis"),
+        "eps_comparison_available": entry.get("eps_comparison_available"),
         "roe": entry.get("roe"),
+        "roe_basis": entry.get("roe_basis"),
+        "pe_ratio_estimated": entry.get("pe_ratio_estimated"),
         "margin_data_status": entry.get("margin_data_status"),
         "gross_margin": entry.get("gross_margin"),
         "operating_margin": entry.get("operating_margin"),
@@ -6622,6 +6733,19 @@ def write_strategy_tracker(
             "industry_priority": row.get("industry_priority"),
             "risk_notes_model": row.get("risk_notes", []),
             "eps": row.get("eps"),
+            "eps_basis": row.get("eps_basis"),
+            "eps_comparison_basis": row.get("eps_comparison_basis"),
+            "eps_comparison_available": row.get("eps_comparison_available"),
+            "financial_period": row.get("financial_period"),
+            "annualized_eps": row.get("annualized_eps"),
+            "eps_ttm": row.get("eps_ttm"),
+            "eps_ttm_basis": row.get("eps_ttm_basis"),
+            "book_value_per_share": row.get("book_value_per_share"),
+            "roe_basis": row.get("roe_basis"),
+            "pe_ratio_estimated": row.get("pe_ratio_estimated"),
+            "per_source": row.get("per_source"),
+            "pbr_source": row.get("pbr_source"),
+            "valuation_trade_date": row.get("valuation_trade_date"),
             "net_income": row.get("net_income"),
             "equity": row.get("equity"),
             "roe": row.get("roe"),

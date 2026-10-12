@@ -145,7 +145,6 @@ jobs:
       AI_STOCK_ALLOW_INCOMPLETE_DATA_PUSH: ${{ inputs.allow_latest_available_data == 'true' && 'true' || 'false' }}
       AI_STOCK_MIN_AVG_VOLUME_LOTS: "500"
       AI_STOCK_VALUATION_NEUTRAL_SCORE: "6"
-      AI_STOCK_VALUATION_EPS_ANNUALIZE_FACTOR: "4"
       AI_STOCK_FINANCIAL_NEUTRAL_SCORE: "6"
       AI_STOCK_CASH_FLOW_NEUTRAL_SCORE: "3"
       AI_STOCK_FINMIND_FUNDAMENTAL_LIMIT: "10"
@@ -286,6 +285,9 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: line-main-result-${{ github.run_id }}
-          path: reports/line-run-result.json
+          path: |
+            reports/line-run-result.json
+            .cache/line-ai-stock-bot/financial_health_latest.json
+          include-hidden-files: true
           retention-days: 30
           if-no-files-found: warn
