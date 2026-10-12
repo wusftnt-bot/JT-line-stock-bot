@@ -3643,8 +3643,9 @@ def recent_market_dates(days: int = 12) -> list[str]:
 
 
 def fetch_tpex_institutional_day(date_key: str) -> list[StockRow]:
-    cached = read_cache(f"tpex_institutional_{date_key}")
-    if isinstance(cached, list):
+    cached = read_cache(f"tpex_institutional_v2_{date_key}")
+    today_key = datetime.now(TAIPEI_TZ).strftime("%Y%m%d")
+    if date_key != today_key and isinstance(cached, list) and cached and all(normalize_market_date(item.get("trade_date")) == date_key for item in cached):
         return cached
 
     day = datetime.strptime(date_key, "%Y%m%d").date()
@@ -3668,13 +3669,13 @@ def fetch_tpex_institutional_day(date_key: str) -> list[StockRow]:
     header_index = next((index for index, line in enumerate(lines) if line.startswith("代號,")), -1)
     if header_index < 0:
         return []
-    title_match = re.search(r"(\d{3})年(\d{2})月(\d{2})日", lines[0])
-    actual_date_key = date_key
-    if title_match:
-        actual_date_key = (
-            f"{int(title_match.group(1)) + 1911:04d}"
-            f"{title_match.group(2)}{title_match.group(3)}"
-        )
+    title_match = re.search(r"(\d{3,4})年(\d{1,2})月(\d{1,2})日", " ".join(lines[:header_index]))
+    if not title_match:
+        print(f"AI_STOCK_TPEX_DATE_UNVERIFIED requested={date_key}")
+        return []
+    year = int(title_match.group(1))
+    year = year + 1911 if year < 300 else year
+    actual_date_key = f"{year:04d}{int(title_match.group(2)):02d}{int(title_match.group(3)):02d}"
 
     rows: list[StockRow] = []
     for row in csv.DictReader(io.StringIO("\n".join(lines[header_index:]))):
@@ -3691,9 +3692,9 @@ def fetch_tpex_institutional_day(date_key: str) -> list[StockRow]:
                 "dealer": clean_number(row.get("自營商-買賣超股數")),
             }
         )
-    if rows:
-        write_cache(f"tpex_institutional_{date_key}", rows)
-    return rows
+    if rows and actual_date_key != today_key:
+        write_cache(f"tpex_institutional_v2_{actual_date_key}", rows)
+    return rows if actual_date_key == date_key else []
 
 
 def fetch_institutional_maps() -> dict[str, list[dict[str, float]]]:
@@ -3712,6 +3713,9 @@ def fetch_institutional_maps() -> dict[str, list[dict[str, float]]]:
             payload = {}
         fields = payload.get("fields", []) if isinstance(payload, dict) else []
         data = payload.get("data", []) if isinstance(payload, dict) else []
+        if data and normalize_market_date(payload.get("date")) != date:
+            print(f"AI_STOCK_TWSE_INSTITUTIONAL_DATE_MISMATCH requested={date}")
+            data = []
         for values in data if fields else []:
             row = dict(zip(fields, values))
             stock_id = str(row.get("證券代號") or row.get("股票代號") or "").strip()
@@ -4252,6 +4256,24 @@ def apply_recommendation_history(
     )
 
 
+def assert_market_sources_current(revenue_rows: list[StockRow], institutional: dict, prices: dict) -> None:
+    required = os.getenv("AI_STOCK_REQUIRED_TRADE_DATE", "")
+    if not required:
+        return
+    counts = {}
+    for market in ("listed", "otc"):
+        ids = {str(row.get("stock_id")) for row in revenue_rows if row.get("market_type") == market and re.fullmatch(r"\d{4}", str(row.get("stock_id") or ""))}
+        if not ids:
+            raise RuntimeError(f"Market universe missing: {market}")
+        price_count = sum(any(normalize_market_date(item.get("date")) == required for item in prices.get(sid, [])) for sid in ids)
+        inst_count = sum(any(normalize_market_date(item.get("trade_date")) == required for item in institutional.get(sid, [])) for sid in ids)
+        minimum = math.ceil(len(ids) * 0.60)
+        counts[market] = {"universe": len(ids), "price": price_count, "institutional": inst_count, "minimum": minimum}
+        if price_count < minimum or inst_count < minimum:
+            raise RuntimeError(f"Current market session incomplete: {market} date={required} prices={price_count} institutional={inst_count} minimum={minimum}")
+    print("AI_STOCK_MARKET_SESSION_COVERAGE " + json.dumps(counts))
+
+
 def build_v2_selection() -> tuple[list[StockRow], list[StockRow], list[StockRow], list[StockRow], list[StockRow]]:
     raw_rows = fetch_twse_monthly_revenue()
     revenue_rows = normalize_revenue(raw_rows)
@@ -4265,6 +4287,7 @@ def build_v2_selection() -> tuple[list[StockRow], list[StockRow], list[StockRow]
     price_history = fetch_all_market_price_history(
         env_int("AI_STOCK_UNIVERSE_HISTORY_DAYS", 65)
     )
+    assert_market_sources_current(revenue_rows, institutional, price_history)
     universe = build_investable_universe(
         revenue_rows,
         margins,

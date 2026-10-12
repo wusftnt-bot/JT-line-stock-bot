@@ -100,6 +100,47 @@ class DeliveryHealthTests(unittest.TestCase):
         self.assertEqual(result, [])
         self.assertEqual(bot.UNIVERSE_REJECTION_REASONS['2330'], 'stale_common_date')
 
+    def test_tpex_old_day_is_not_cached_as_requested_today(self):
+        text = '115年10月8日\n代號,外資及陸資(不含外資自營商)-買賣超股數,投信-買賣超股數,自營商-買賣超股數\n6488,100,20,0\n'
+        with patch.object(bot, 'read_cache', return_value=None), patch.object(bot, 'request_text', return_value=text), patch.object(bot, 'write_cache') as cache:
+            rows = bot.fetch_tpex_institutional_day('20261012')
+        self.assertEqual(rows, [])
+        self.assertEqual(cache.call_args.args[0], 'tpex_institutional_v2_20261008')
+
+    def test_poisoned_tpex_cache_is_refetched(self):
+        bad = [{'trade_date': '20261008'}]
+        text = '115年10月12日\n代號,外資及陸資(不含外資自營商)-買賣超股數,投信-買賣超股數,自營商-買賣超股數\n6488,100,20,0\n'
+        with patch.object(bot, 'read_cache', return_value=bad), patch.object(bot, 'request_text', return_value=text) as request, patch.object(bot, 'write_cache'):
+            rows = bot.fetch_tpex_institutional_day('20261012')
+        request.assert_called_once()
+        self.assertEqual(rows[0]['trade_date'], '20261012')
+
+    def test_wrong_twse_response_date_is_not_relabelled(self):
+        payload = {'date': '20261008', 'fields': ['證券代號'], 'data': [['2330']]}
+        with patch.object(bot, 'recent_market_dates', return_value=['20261012']), patch.object(bot, 'fetch_with_retry', return_value=payload), patch.object(bot, 'fetch_tpex_institutional_day', return_value=[]):
+            self.assertEqual(bot.fetch_institutional_maps(), {})
+
+    def test_formal_report_requires_both_market_sessions(self):
+        revenue = [{'stock_id': '2330', 'market_type': 'listed'}, {'stock_id': '6488', 'market_type': 'otc'}]
+        prices = {'2330': [{'date': '20261012'}], '6488': [{'date': '20261012'}]}
+        inst = {'2330': [{'trade_date': '20261012'}], '6488': [{'trade_date': '20261008'}]}
+        with patch.dict(os.environ, {'AI_STOCK_REQUIRED_TRADE_DATE': '20261012'}):
+            with self.assertRaisesRegex(RuntimeError, 'otc'):
+                bot.assert_market_sources_current(revenue, inst, prices)
+            inst['6488'] = [{'trade_date': '20261012'}]
+            bot.assert_market_sources_current(revenue, inst, prices)
+
+    def test_same_day_institutional_data_is_always_refreshed(self):
+        today = bot.datetime.now(bot.TAIPEI_TZ).date()
+        key = today.strftime('%Y%m%d')
+        caption = f'{today.year - 1911}年{today.month}月{today.day}日'
+        text = caption + '\n代號,外資及陸資(不含外資自營商)-買賣超股數,投信-買賣超股數,自營商-買賣超股數\n6488,200,20,0\n'
+        with patch.object(bot, 'read_cache', return_value=[{'trade_date': key, 'foreign': 1}]), patch.object(bot, 'request_text', return_value=text) as request, patch.object(bot, 'write_cache') as cache:
+            rows = bot.fetch_tpex_institutional_day(key)
+        request.assert_called_once()
+        cache.assert_not_called()
+        self.assertEqual(rows[0]['foreign'], 200)
+
 
 if __name__ == '__main__':
     unittest.main()
