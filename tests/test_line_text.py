@@ -81,6 +81,7 @@ def stock(stock_id: str, bucket: str, rank: int, *, latest_institutional: float 
 
 
 class DummyResponse:
+    status = 200
     def __enter__(self):
         return self
 
@@ -169,6 +170,7 @@ class LineTextTests(unittest.TestCase):
                 clear=False,
             ),
             patch.object(bot, "urlopen", side_effect=fake_urlopen),
+            patch.object(bot, "write_run_result"),
         ):
             bot.push_line_message("文字測試")
 

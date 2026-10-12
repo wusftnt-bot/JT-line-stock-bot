@@ -1,6 +1,20 @@
 name: daily-ai-stock-line-bot
 
 on:
+  workflow_call:
+    inputs:
+      allow_latest_available_data:
+        type: string
+        default: 'false'
+      mark_sent:
+        type: string
+        default: 'false'
+      force_fresh_push:
+        type: string
+        default: 'false'
+      line_test_push:
+        type: string
+        default: 'true'
   workflow_dispatch:
     inputs:
       allow_latest_available_data:
@@ -36,9 +50,9 @@ on:
           - "false"
           - "true"
   schedule:
-    # 20:00-20:30 Asia/Taipei every 5 minutes. GitHub Actions schedules use UTC.
+    # External trigger starts at 20:00; native recovery runs until 21:46 Taipei.
     # Frequent slots reduce best-effort schedule misses; sent marker and concurrency prevent duplicates.
-    - cron: "0,5,10,15,20,25,30 12 * * 1-5"
+    - cron: "1,16,31,46 12-13 * * 1-5"
 
 concurrency:
   group: line-stock-bot-${{ github.ref }}
@@ -128,7 +142,7 @@ jobs:
       AI_STOCK_LINE_EXIT_DISPLAY_LIMIT: "3"
       AI_STOCK_LINE_AI_REVIEW_DISPLAY_LIMIT: "3"
       AI_STOCK_GEMINI_REVIEW_LIMIT: "3"
-      AI_STOCK_ALLOW_INCOMPLETE_DATA_PUSH: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_latest_available_data == 'true' && 'true' || 'false' }}
+      AI_STOCK_ALLOW_INCOMPLETE_DATA_PUSH: ${{ inputs.allow_latest_available_data == 'true' && 'true' || 'false' }}
       AI_STOCK_MIN_AVG_VOLUME_LOTS: "500"
       AI_STOCK_VALUATION_NEUTRAL_SCORE: "6"
       AI_STOCK_VALUATION_EPS_ANNUALIZE_FACTOR: "4"
@@ -141,7 +155,7 @@ jobs:
       AI_STOCK_FAIL_ON_ANALYSIS_ERROR: "true"
       AI_STOCK_MARGIN_RISK_RATIO: "0.20"
       LINE_BROADCAST: "false"
-      LINE_TEST_PUSH: ${{ github.event_name == 'workflow_dispatch' && inputs.line_test_push == 'true' && 'true' || 'false' }}
+      LINE_TEST_PUSH: ${{ inputs.line_test_push == 'true' && 'true' || 'false' }}
       DAILY_FINANCE_REPORT_URL: "https://wusftnt-bot.github.io/daily-finance-report/"
       FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -150,7 +164,7 @@ jobs:
       GEMINI_TIMEOUT_SEC: "20"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Resolve Taipei date
         id: taipei
@@ -175,7 +189,7 @@ jobs:
         shell: bash
         run: |
           hm="${{ steps.taipei.outputs.hm }}"
-          if [ "${{ github.event_name }}" = "schedule" ] && { [ "$hm" -lt 2000 ] || [ "$hm" -gt 2030 ]; }; then
+          if [ "${{ github.event_name }}" = "schedule" ] && { [ "$hm" -lt 2000 ] || [ "$hm" -gt 2200 ]; }; then
             echo "allowed=false" >> "$GITHUB_OUTPUT"
             echo "LINE stock bot schedule fired outside Taipei push window; skip push. taipei_hm=$hm"
           else
@@ -185,7 +199,7 @@ jobs:
       - name: Restore sent marker
         id: sent-cache
         if: steps.push-window.outputs.allowed == 'true'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ${{ steps.taipei.outputs.sent_marker }}
           key: ${{ steps.taipei.outputs.sent_cache_key }}
@@ -195,7 +209,7 @@ jobs:
         if: steps.push-window.outputs.allowed == 'true'
         shell: bash
         run: |
-          if [ "${{ steps.taipei.outputs.should_mark_sent }}" = "true" ] && [ "${{ steps.sent-cache.outputs.cache-hit }}" = "true" ]; then
+          if [ "${{ inputs.line_test_push || 'false' }}" != "true" ] && [ "${{ steps.taipei.outputs.force_fresh_push }}" != "true" ] && [ "${{ steps.sent-cache.outputs.cache-hit }}" = "true" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
             echo "LINE stock bot already sent today via cache marker; skip duplicate trigger."
           else
@@ -204,7 +218,7 @@ jobs:
 
       - name: Restore AI stock data cache
         if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: .cache/line-ai-stock-bot
           key: ${{ steps.taipei.outputs.data_cache_prefix }}${{ steps.taipei.outputs.today }}
@@ -213,11 +227,12 @@ jobs:
 
       - name: Set up Python
         if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
       - name: Run AI stock bot and push LINE message
+        id: report
         timeout-minutes: 62
         if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true'
         shell: bash
@@ -225,7 +240,7 @@ jobs:
           AI_STOCK_DATA_CACHE_DIR: .cache/line-ai-stock-bot
         run: |
           start_ts=$(date +%s)
-          python scripts/ai_stock_bot.py --push-line
+          python -u scripts/ai_stock_bot.py --push-line
           end_ts=$(date +%s)
           elapsed=$((end_ts - start_ts))
           elapsed_text="$((elapsed / 60))m $((elapsed % 60))s"
@@ -238,7 +253,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Create sent marker
-        if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true' && steps.taipei.outputs.should_mark_sent == 'true'
+        if: steps.report.outputs.delivery_status == 'sent' && steps.taipei.outputs.should_mark_sent == 'true'
         shell: bash
         run: |
           mkdir -p "$(dirname "${{ steps.taipei.outputs.sent_marker }}")"
@@ -251,8 +266,8 @@ jobs:
           } > "${{ steps.taipei.outputs.sent_marker }}"
 
       - name: Save sent marker
-        if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true' && steps.taipei.outputs.should_mark_sent == 'true'
-        uses: actions/cache/save@v4
+        if: steps.report.outputs.delivery_status == 'sent' && steps.taipei.outputs.should_mark_sent == 'true'
+        uses: actions/cache/save@v5
         continue-on-error: true
         with:
           path: ${{ steps.taipei.outputs.sent_marker }}
@@ -260,8 +275,17 @@ jobs:
 
       - name: Save AI stock data cache
         if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         continue-on-error: true
         with:
           path: .cache/line-ai-stock-bot
           key: ${{ steps.taipei.outputs.data_cache_prefix }}${{ steps.taipei.outputs.today }}-${{ github.run_id }}
+
+      - name: Save operational result
+        if: always() && steps.report.outcome != 'skipped'
+        uses: actions/upload-artifact@v6
+        with:
+          name: line-main-result-${{ github.run_id }}
+          path: reports/line-run-result.json
+          retention-days: 30
+          if-no-files-found: warn

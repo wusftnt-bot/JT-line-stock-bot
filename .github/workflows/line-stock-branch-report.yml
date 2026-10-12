@@ -30,8 +30,7 @@ on:
   schedule:
     # 21:10-21:55 Asia/Taipei retries, Monday-Friday. GitHub Actions schedules use UTC.
     # If the 20:00 primary analysis finishes late, later slots can still send the AI review.
-    - cron: "10 13 * * 1-5"
-    - cron: "25,40,55 13 * * 1-5"
+    - cron: "15,30,45,59 13 * * 1-5"
 
 concurrency:
   group: line-stock-ai-review-${{ github.ref }}
@@ -63,7 +62,7 @@ jobs:
       LINE_TEST_PUSH: ${{ github.event_name == 'workflow_dispatch' && inputs.line_test_push == 'true' && 'true' || 'false' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Resolve Taipei date
         id: taipei
@@ -97,7 +96,7 @@ jobs:
       - name: Restore AI review sent marker
         id: sent-cache
         if: steps.push-window.outputs.allowed == 'true'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ${{ steps.taipei.outputs.sent_marker }}
           key: ${{ steps.taipei.outputs.sent_cache_key }}
@@ -119,7 +118,7 @@ jobs:
 
       - name: Restore AI stock data cache
         if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: .cache/line-ai-stock-bot
           key: ${{ steps.taipei.outputs.data_cache_prefix }}${{ steps.taipei.outputs.today }}
@@ -129,7 +128,7 @@ jobs:
 
       - name: Set up Python
         if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true'
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
@@ -142,19 +141,13 @@ jobs:
         run: |
           set -euo pipefail
           start_ts=$(date +%s)
-          output="$(python scripts/ai_stock_bot.py --branch-report --push-line)"
-          printf '%s\n' "$output"
-          if printf '%s\n' "$output" | grep -q "尚未找到今日 20:00 主推播候選名單"; then
-            echo "has_entries=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_entries=true" >> "$GITHUB_OUTPUT"
-          fi
+          python -u scripts/ai_stock_bot.py --branch-report --push-line
           end_ts=$(date +%s)
           elapsed=$((end_ts - start_ts))
           echo "AI_STOCK_REVIEW_WORKFLOW_RUNTIME elapsed_seconds=$elapsed"
 
       - name: Create AI review sent marker
-        if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true' && steps.review.outputs.has_entries == 'true' && steps.taipei.outputs.should_mark_sent == 'true'
+        if: steps.review.outputs.delivery_status == 'sent' && steps.taipei.outputs.should_mark_sent == 'true'
         shell: bash
         run: |
           mkdir -p "$(dirname "${{ steps.taipei.outputs.sent_marker }}")"
@@ -167,9 +160,18 @@ jobs:
           } > "${{ steps.taipei.outputs.sent_marker }}"
 
       - name: Save AI review sent marker
-        if: steps.push-window.outputs.allowed == 'true' && steps.sent.outputs.skip != 'true' && steps.review.outputs.has_entries == 'true' && steps.taipei.outputs.should_mark_sent == 'true'
-        uses: actions/cache/save@v4
+        if: steps.review.outputs.delivery_status == 'sent' && steps.taipei.outputs.should_mark_sent == 'true'
+        uses: actions/cache/save@v5
         continue-on-error: true
         with:
           path: ${{ steps.taipei.outputs.sent_marker }}
           key: ${{ steps.taipei.outputs.sent_cache_key }}
+
+      - name: Save operational result
+        if: always() && steps.review.outcome != 'skipped'
+        uses: actions/upload-artifact@v6
+        with:
+          name: line-review-result-${{ github.run_id }}
+          path: reports/line-run-result.json
+          retention-days: 30
+          if-no-files-found: warn

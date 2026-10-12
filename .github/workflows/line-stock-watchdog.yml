@@ -1,112 +1,24 @@
 name: line-stock-watchdog
-
 on:
   workflow_dispatch:
   schedule:
-    # 20:10-21:10 Asia/Taipei backup checks. GitHub Actions schedules use UTC.
-    - cron: "10,20,30,40,50 12 * * 1-5"
-    - cron: "0,10 13 * * 1-5"
-
+    - cron: "17,32,47 12-13 * * 1-5"
+concurrency:
+  group: line-stock-watchdog
+  cancel-in-progress: false
 jobs:
   ensure-line-stock-run:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       actions: write
       contents: read
     steps:
-      - name: Check and backfill stock workflow
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Check actual delivery and recover
         env:
           GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          WORKFLOW_FILE: daily-stock-line-bot.yml
-        shell: bash
-        run: |
-          set -euo pipefail
-          python - <<'PY'
-          import json
-          import os
-          import sys
-          import urllib.request
-          from datetime import datetime, time, timedelta, timezone
-
-          token = os.environ["GH_TOKEN"]
-          repo = os.environ["REPO"]
-          workflow_file = os.environ["WORKFLOW_FILE"]
-          taipei = timezone(timedelta(hours=8))
-          taipei_now = datetime.now(taipei)
-          hm = taipei_now.hour * 100 + taipei_now.minute
-          if hm < 2010 or hm > 2110:
-              print(f"LINE_STOCK_WATCHDOG outside Taipei push window; skip. taipei={taipei_now:%Y-%m-%d %H:%M}")
-              sys.exit(0)
-
-          headers = {
-              "Accept": "application/vnd.github+json",
-              "Authorization": f"Bearer {token}",
-              "Content-Type": "application/json",
-              "User-Agent": "line-stock-watchdog",
-              "X-GitHub-Api-Version": "2022-11-28",
-          }
-
-          def request(method: str, path: str, data: bytes | None = None):
-              url = f"https://api.github.com/repos/{repo}{path}"
-              req = urllib.request.Request(url, data=data, headers=headers, method=method)
-              with urllib.request.urlopen(req, timeout=45) as response:
-                  body = response.read().decode("utf-8")
-                  return json.loads(body) if body else {}
-
-          now = datetime.now(timezone.utc)
-          window_start = datetime.combine(now.date(), time(11, 40), tzinfo=timezone.utc)
-          runs = request("GET", f"/actions/workflows/{workflow_file}/runs?per_page=20").get("workflow_runs", [])
-          stale_minutes = int(os.getenv("STALE_RUN_MINUTES", "55"))
-
-          matching = []
-          for run in runs:
-              created = datetime.fromisoformat(run["created_at"].replace("Z", "+00:00"))
-              if created >= window_start and run.get("event") in {"schedule", "workflow_dispatch"}:
-                  matching.append(run)
-
-          stale_running = []
-          healthy = [
-              run for run in matching
-              if run.get("status") == "completed" and run.get("conclusion") == "success"
-          ]
-          for run in matching:
-              if run.get("status") not in {"queued", "in_progress"}:
-                  continue
-              created = datetime.fromisoformat(run["created_at"].replace("Z", "+00:00"))
-              age_minutes = (now - created).total_seconds() / 60
-              if age_minutes <= stale_minutes:
-                  healthy.append(run)
-              else:
-                  stale_running.append(run)
-          if healthy:
-              best = healthy[0]
-              print(
-                  "LINE_STOCK_WATCHDOG ok "
-                  f"run_id={best.get('id')} status={best.get('status')} "
-                  f"conclusion={best.get('conclusion')} created_at={best.get('created_at')}"
-              )
-              sys.exit(0)
-
-          for run in stale_running:
-              try:
-                  request("POST", f"/actions/runs/{run.get('id')}/cancel", b"")
-                  print(f"LINE_STOCK_WATCHDOG canceled stale run_id={run.get('id')} status={run.get('status')}")
-              except Exception as error:
-                  print(f"LINE_STOCK_WATCHDOG cancel_failed run_id={run.get('id')} error={type(error).__name__}:{error}")
-
-          payload = json.dumps({
-              "ref": "main",
-              "inputs": {
-                  "allow_latest_available_data": "false",
-                  "mark_sent": "true",
-                  "force_fresh_push": "true",
-              },
-          }).encode("utf-8")
-          request("POST", f"/actions/workflows/{workflow_file}/dispatches", payload)
-          failed = [
-              f"{run.get('id')}:{run.get('status')}:{run.get('conclusion')}"
-              for run in matching[:5]
-          ]
-          print("LINE_STOCK_WATCHDOG dispatched backup run; prior=" + ",".join(failed))
-          PY
+        run: python scripts/line_watchdog.py

@@ -12,12 +12,18 @@ import re
 import signal
 import sys
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+try:
+    from scripts.market_calendar import expected_trade_date, is_trading_day
+except ModuleNotFoundError:
+    from market_calendar import expected_trade_date, is_trading_day
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -2762,7 +2768,10 @@ def audit_candidate_pool(candidates: list[StockRow], universe: list[StockRow]) -
         warnings.append("pool_not_full")
     if previous and identical_streak >= env_int("AI_STOCK_AUDIT_IDENTICAL_WARN_DAYS", 3):
         warnings.append("pool_identical_multiple_days")
-    if previous and stale_trade_date_streak >= env_int("AI_STOCK_AUDIT_STALE_DATE_WARN_DAYS", 2):
+    expected_date = expected_trade_date(datetime.strptime(today, "%Y-%m-%d").date())
+    if common_date_text and common_date_text != expected_date:
+        warnings.append("common_trade_date_not_expected")
+    if previous and stale_trade_date_streak >= env_int("AI_STOCK_AUDIT_STALE_DATE_WARN_DAYS", 2) and common_date_text != expected_date:
         warnings.append("common_trade_date_not_advanced")
     if not common_date_text:
         warnings.append("common_trade_date_missing")
@@ -2782,6 +2791,7 @@ def audit_candidate_pool(candidates: list[StockRow], universe: list[StockRow]) -
         "overlap_ratio": round(overlap_ratio, 4),
         "pool_hash": current_hash,
         "common_trade_dates": common_date_text,
+        "expected_trade_date": expected_date,
         "identical_streak": identical_streak,
         "stale_trade_date_streak": stale_trade_date_streak,
         "cutoff_composite_pre_score": round(cutoff_score, 2),
@@ -5640,6 +5650,10 @@ def assert_three_layer_candidate_pipeline_ready() -> None:
     }
     if not env_bool("AI_STOCK_ALLOW_INCOMPLETE_DATA_PUSH", False):
         blocking_warning_names.add("common_trade_date_not_advanced")
+        blocking_warning_names.add("common_trade_date_not_expected")
+        expected = expected_trade_date(datetime.now(TAIPEI_TZ).date())
+        if trade_date != expected:
+            raise RuntimeError(f"Candidate trade date stale: expected={expected} actual={trade_date}")
     blocking_warnings = blocking_warning_names & warnings
     if blocking_warnings:
         raise RuntimeError(
@@ -5651,6 +5665,25 @@ def assert_three_layer_candidate_pipeline_ready() -> None:
         "AI_STOCK_THREE_LAYER_READY "
         f"investable={investable} deep={deep} target={target} trade_date={trade_date}"
     )
+
+
+def write_run_result(status: str, **details: Any) -> None:
+    """Persist only operational fields; never include credentials, recipients, or raw errors."""
+    result = {
+        "status": status,
+        "date": datetime.now(TAIPEI_TZ).date().isoformat(),
+        "report_type": os.getenv("LINE_REPORT_TYPE", "main"),
+        "test": env_bool("LINE_TEST_PUSH"),
+        "run_id": os.getenv("GITHUB_RUN_ID", "local"),
+        "updated_at": datetime.now(TAIPEI_TZ).isoformat(),
+        **details,
+    }
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    (REPORT_DIR / "line-run-result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    if os.getenv("GITHUB_OUTPUT"):
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+            output.write(f"delivery_status={status}\n")
+    print(f"LINE_RUN_RESULT status={status} report={result['report_type']}")
 
 
 def push_line_message(message: str) -> None:
@@ -5692,17 +5725,36 @@ def push_line_message(message: str) -> None:
         headers={
             "Authorization": f"Bearer {channel_access_token}",
             "Content-Type": "application/json",
+            "X-Line-Retry-Key": str(
+                uuid.uuid4() if env_bool("LINE_TEST_PUSH") else uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"JT-line-stock-bot:{datetime.now(TAIPEI_TZ).date()}:{os.getenv('LINE_REPORT_TYPE', 'main')}:{line_to or 'broadcast'}",
+                )
+            ),
         },
         method="POST",
     )
 
-    try:
-        with urlopen(request, timeout=60):
-            return
-    except HTTPError as error:
-        details = error.read().decode("utf-8", errors="replace")
-        mode = "broadcast" if use_broadcast else "push"
-        raise RuntimeError(f"LINE Bot {mode} failed: HTTP {error.code} {details}") from error
+    for attempt in range(3):
+        try:
+            with urlopen(request, timeout=60) as response:
+                write_run_result("sent", http_status=response.status, payload_length=len(payload_text))
+                return
+        except HTTPError as error:
+            if error.code == 409 and error.headers.get("x-line-accepted-request-id"):
+                write_run_result("sent", http_status=409, duplicate_accepted=True)
+                return
+            if error.code < 500 and error.code != 429:
+                write_run_result("delivery_failed", http_status=error.code)
+                raise RuntimeError(f"LINE push rejected: HTTP {error.code}; check channel credentials, recipient and quota") from None
+            if attempt == 2:
+                write_run_result("delivery_failed", http_status=error.code)
+                raise RuntimeError(f"LINE push unavailable: HTTP {error.code}") from None
+        except (URLError, TimeoutError, OSError):
+            if attempt == 2:
+                write_run_result("delivery_failed", reason="network_timeout")
+                raise RuntimeError("LINE push network timeout after safe retries") from None
+        time.sleep(2 ** attempt)
 
 
 def compact_for_gemini(row: StockRow, bucket: str) -> dict[str, Any]:
@@ -6656,10 +6708,17 @@ def main() -> None:
     parser.add_argument("--branch-report", action="store_true", help="Push an AI review and institutional-risk follow-up for today's candidates.")
     args = parser.parse_args()
 
+    os.environ["LINE_REPORT_TYPE"] = "ai_review" if args.branch_report else "main"
+    write_run_result("started")
+
     started_at = datetime.now(TAIPEI_TZ)
     started_perf = time.perf_counter()
     push_enabled = args.push_line or env_bool("ENABLE_LINE_PUSH")
     install_run_deadline()
+    if push_enabled and not env_bool("LINE_TEST_PUSH") and not is_trading_day(started_at.date()):
+        write_run_result("non_trading_day", expected_trade_date=expected_trade_date(started_at.date()))
+        print("LINE_MARKET_CLOSED no daily recommendation on a non-trading day")
+        return
     if args.branch_report:
         message = build_branch_report_message()
         print(message)
@@ -6670,6 +6729,8 @@ def main() -> None:
             push_line_message(message)
         elif push_enabled and empty_review:
             print("AI_REVIEW_EMPTY_SUPPRESSED no LINE push; waiting for a later retry slot.")
+            write_run_result("waiting_for_primary")
+            raise RuntimeError("AI review waiting for the current primary candidate snapshot")
         print_run_metrics("finished", started_at, started_perf, counts)
         return
 
@@ -6731,4 +6792,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as error:
+        result_path = REPORT_DIR / "line-run-result.json"
+        result = json.loads(result_path.read_text(encoding="utf-8")) if result_path.exists() else {}
+        if result.get("status") not in {"delivery_failed", "waiting_for_primary"}:
+            write_run_result("analysis_failed", error_type=type(error).__name__)
+        raise

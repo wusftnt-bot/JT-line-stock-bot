@@ -1,0 +1,44 @@
+name: line-bot-health
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['scripts/**', 'tests/**', '.github/workflows/**', 'data/market_calendar_*.json']
+  schedule:
+    - cron: "23 3 * * 1"
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - run: python -m unittest discover -s tests -v
+      - run: python scripts/market_calendar.py
+  maintain:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v6
+      - name: Persist monthly health check and reenable schedules
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/line_health.py
+  test-line:
+    if: github.event_name == 'push' && contains(github.event.head_commit.message, '[line-test]')
+    needs: verify
+    uses: ./.github/workflows/daily-stock-line-bot.yml
+    with:
+      allow_latest_available_data: 'true'
+      mark_sent: 'false'
+      force_fresh_push: 'true'
+      line_test_push: 'true'
+    secrets: inherit
