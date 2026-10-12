@@ -3417,7 +3417,7 @@ def _table_rows(payload: Any, required_field: str) -> list[dict[str, Any]]:
 def fetch_all_market_day(day: datetime.date) -> list[StockRow]:
     date_key = day.strftime("%Y%m%d")
     cached = read_cache(f"all_market_day_{date_key}")
-    cached_rows = cached if isinstance(cached, list) else []
+    cached_rows = cached if isinstance(cached, list) and date_key != datetime.now(TAIPEI_TZ).strftime("%Y%m%d") else []
     cached_markets = {
         str(row.get("market_type") or "")
         for row in cached_rows
