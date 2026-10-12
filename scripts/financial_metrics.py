@@ -86,10 +86,12 @@ def derive_financial_metrics(record: dict, periods: dict) -> dict:
         # EPS denominators may differ between reports, so this bridge is an estimate.
         result.update({"eps_ttm": round(annual_eps + eps - prior_eps, 6), "eps_ttm_basis": "ytd_bridge_estimate"})
 
-    use_parent = number(record.get("owner_net_income")) is not None and (number(record.get("parent_equity")) or 0) > 0
+    use_parent = number(record.get("owner_net_income")) is not None and number(record.get("parent_equity")) is not None
     income_key, equity_key = ("owner_net_income", "parent_equity") if use_parent else ("net_income", "equity")
     income, equity = number(record.get(income_key)), number(record.get(equity_key))
     result["roe_scope"] = "parent" if use_parent else "consolidated"
+    if equity is not None and equity <= 0:
+        result["roe_basis"] = "non_positive_equity"
     if income is not None and equity is not None and equity > 0:
         beginning_equity = number(annual.get(equity_key))
         divisor = (equity + beginning_equity) / 2 if beginning_equity is not None and beginning_equity > 0 else equity

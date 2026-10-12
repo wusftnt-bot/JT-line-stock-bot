@@ -62,6 +62,12 @@ class FinancialMetricsTests(unittest.TestCase):
         self.assertAlmostEqual(row['roe'], 19.36)
         self.assertTrue(row['roe_basis'].endswith('estimate'))
 
+    def test_non_positive_parent_equity_is_not_replaced_by_subsidiary_equity(self):
+        row = derive_financial_metrics({'financial_period': '2026Q2', 'eps': 1, 'owner_net_income': 20, 'parent_equity': -10, 'net_income': 50, 'equity': 500}, {})
+        self.assertIsNone(row['roe'])
+        self.assertEqual(row['roe_scope'], 'parent')
+        self.assertEqual(row['roe_basis'], 'non_positive_equity')
+
     def test_no_pbr_from_unrelated_pe_and_roe(self):
         row = {'close': 100, 'pe_ratio': 12, 'roe': 40}
         self.assertFalse(fill_valuation_estimates(row))
