@@ -82,6 +82,24 @@ class DeliveryHealthTests(unittest.TestCase):
         with patch.dict(os.environ, {'LINE_TEST_PUSH': 'false', 'AI_STOCK_BRANCH_ALLOW_LATEST_DATA': 'false'}), patch.object(bot, 'read_cache', side_effect=[tracker, receipt]):
             self.assertEqual(bot.today_strategy_entries(), [{'stock_id': '2330'}])
 
+    def test_history_does_not_request_known_closed_dates(self):
+        calls = []
+        rows = [{'stock_id': '2330', 'market_type': 'listed', 'date': '20260924'}]
+        rows += [{'stock_id': '6488', 'market_type': 'otc', 'date': '20260924'}]
+        with patch.object(bot, 'datetime') as clock, patch.object(bot, 'fetch_all_market_day', side_effect=lambda day: calls.append(day) or rows):
+            clock.now.return_value.date.return_value = date(2026, 9, 28)
+            bot.fetch_all_market_price_history(target_days=1)
+        self.assertEqual(calls, [date(2026, 9, 24)])
+
+    def test_formal_universe_rejects_old_individual_session(self):
+        rows = [{'stock_id': '2330', 'market_type': 'listed'}]
+        prices = {'2330': [{'date': '20261008', 'market_type': 'listed'}]}
+        institutional = {'2330': [{'trade_date': '20261008'}]}
+        with patch.dict(os.environ, {'AI_STOCK_REQUIRED_TRADE_DATE': '20261012'}):
+            result = bot.build_investable_universe(rows, {}, {}, institutional, {}, prices)
+        self.assertEqual(result, [])
+        self.assertEqual(bot.UNIVERSE_REJECTION_REASONS['2330'], 'stale_common_date')
+
 
 if __name__ == '__main__':
     unittest.main()

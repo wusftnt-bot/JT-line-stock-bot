@@ -2247,6 +2247,10 @@ def build_investable_universe(
             reject(stock_id, "date_mismatch")
             continue
         aligned_date = max(common_dates)
+        required_date = os.getenv("AI_STOCK_REQUIRED_TRADE_DATE", "")
+        if required_date and aligned_date != required_date:
+            reject(stock_id, "stale_common_date")
+            continue
         aligned_records = [
             item
             for item in records
@@ -3425,7 +3429,7 @@ def fetch_all_market_price_history(target_days: int = 65) -> dict[str, list[Stoc
     max_calendar_days = max(target_days * 3, 150)
     for offset in range(max_calendar_days):
         day = today - timedelta(days=offset)
-        if day.weekday() >= 5:
+        if not is_trading_day(day):
             continue
         daily_rows = fetch_all_market_day(day)
         if not daily_rows:
@@ -3559,7 +3563,7 @@ def recent_market_dates(days: int = 12) -> list[str]:
     dates = []
     for offset in range(days):
         day = today - timedelta(days=offset)
-        if day.weekday() < 5:
+        if is_trading_day(day):
             dates.append(day.strftime("%Y%m%d"))
     return dates
 
@@ -4868,6 +4872,7 @@ def _readable_candidate_audit(status: str) -> str:
         "pool_not_full": "候選池不足",
         "pool_identical_multiple_days": "候選池連續多日相同",
         "common_trade_date_not_advanced": "共同交易日未更新",
+        "common_trade_date_not_expected": "資料尚未更新至本交易日",
         "common_trade_date_missing": "共同交易日缺漏",
     }
     date_labels = [
@@ -6730,6 +6735,8 @@ def main() -> None:
     started_at = datetime.now(TAIPEI_TZ)
     started_perf = time.perf_counter()
     push_enabled = args.push_line or env_bool("ENABLE_LINE_PUSH")
+    if push_enabled and not env_bool("AI_STOCK_ALLOW_INCOMPLETE_DATA_PUSH"):
+        os.environ["AI_STOCK_REQUIRED_TRADE_DATE"] = expected_trade_date(started_at.date())
     install_run_deadline()
     if push_enabled and not env_bool("LINE_TEST_PUSH") and not is_trading_day(started_at.date()):
         write_run_result("non_trading_day", expected_trade_date=expected_trade_date(started_at.date()))
