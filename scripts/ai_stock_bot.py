@@ -5680,6 +5680,13 @@ def write_run_result(status: str, **details: Any) -> None:
     }
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     (REPORT_DIR / "line-run-result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    if status == "sent" and result["report_type"] == "main" and not result["test"]:
+        write_cache("primary_delivery_receipt", {
+            "date": result["date"],
+            "sent": True,
+            "test": False,
+            "trade_date": _status_value(DATA_SOURCE_STATUS.get("candidate_audit", ""), "trade_date"),
+        })
     if os.getenv("GITHUB_OUTPUT"):
         with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
             output.write(f"delivery_status={status}\n")
@@ -6333,6 +6340,15 @@ def today_strategy_entries() -> list[dict[str, Any]]:
     tracker = read_cache("strategy_tracker")
     history = tracker.get("history", []) if isinstance(tracker, dict) else []
     today = datetime.now(TAIPEI_TZ).strftime("%Y-%m-%d")
+    if not env_bool("LINE_TEST_PUSH") and not env_bool("AI_STOCK_BRANCH_ALLOW_LATEST_DATA"):
+        receipt = read_cache("primary_delivery_receipt") or {}
+        if (
+            receipt.get("date") != today
+            or not receipt.get("sent")
+            or receipt.get("test")
+            or receipt.get("trade_date") != expected_trade_date(datetime.now(TAIPEI_TZ).date())
+        ):
+            return []
     for day_record in reversed(history):
         if str(day_record.get("date") or "") == today:
             entries = day_record.get("entries", [])

@@ -69,6 +69,19 @@ class DeliveryHealthTests(unittest.TestCase):
         self.assertNotIn('private-key', record)
         self.assertEqual(json.loads(record)['http_status'], 401)
 
+    def test_review_rejects_unconfirmed_primary_cache(self):
+        today = bot.datetime.now(bot.TAIPEI_TZ).date().isoformat()
+        tracker = {'history': [{'date': today, 'entries': [{'stock_id': '2330'}]}]}
+        with patch.dict(os.environ, {'LINE_TEST_PUSH': 'false', 'AI_STOCK_BRANCH_ALLOW_LATEST_DATA': 'false'}), patch.object(bot, 'read_cache', side_effect=[tracker, {}]):
+            self.assertEqual(bot.today_strategy_entries(), [])
+
+    def test_review_accepts_confirmed_current_session(self):
+        today = bot.datetime.now(bot.TAIPEI_TZ).date()
+        tracker = {'history': [{'date': today.isoformat(), 'entries': [{'stock_id': '2330'}]}]}
+        receipt = {'date': today.isoformat(), 'sent': True, 'test': False, 'trade_date': calendar.expected_trade_date(today)}
+        with patch.dict(os.environ, {'LINE_TEST_PUSH': 'false', 'AI_STOCK_BRANCH_ALLOW_LATEST_DATA': 'false'}), patch.object(bot, 'read_cache', side_effect=[tracker, receipt]):
+            self.assertEqual(bot.today_strategy_entries(), [{'stock_id': '2330'}])
+
 
 if __name__ == '__main__':
     unittest.main()
