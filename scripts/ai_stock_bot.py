@@ -4318,6 +4318,8 @@ def build_v2_selection() -> tuple[list[StockRow], list[StockRow], list[StockRow]
                 else calculate_technical_score(enriched["stock_id"])
             )
         official_record = official_valuation.get(enriched["stock_id"])
+        if official_record and official_record.get("valuation_trade_date") != normalize_market_date(enriched.get("aligned_trade_date")):
+            official_record = None
         if official_record:
             enriched.update(official_record)
         if index < finmind_fundamental_limit:
