@@ -40,7 +40,11 @@ def update_period_history(history: dict, previous: dict, current: dict) -> dict:
                 continue
             period = canonical_period(record.get("financial_period"))
             if period:
-                stocks.setdefault(sid, {})[period] = dict(record, financial_period=period)
+                existing = stocks.setdefault(sid, {}).get(period, {})
+                merged = dict(existing)
+                merged.update({key: value for key, value in record.items() if value is not None or key not in existing})
+                merged["financial_period"] = period
+                stocks[sid][period] = merged
     return {"schema": "mops_period_history_v2", "stocks": {
         sid: {period: periods[period] for period in sorted(periods)[-16:]}
         for sid, periods in stocks.items()

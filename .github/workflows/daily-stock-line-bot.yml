@@ -63,9 +63,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 70
     permissions:
-      contents: read
+      contents: write
     env:
       ENABLE_LINE_PUSH: "true"
+      FINANCIAL_JOURNAL_TOKEN: ${{ github.token }}
       LINE_CHANNEL_ACCESS_TOKEN: ${{ secrets.AI_POWERED_STOCK }}
       LINE_TO: ${{ secrets.LINE_TO }}
       AI_STOCK_TOP_LIMIT: "10"

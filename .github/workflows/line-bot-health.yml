@@ -35,6 +35,8 @@ jobs:
   test-line:
     if: github.event_name == 'push' && contains(github.event.head_commit.message, '[line-test]')
     needs: verify
+    permissions:
+      contents: write
     uses: ./.github/workflows/daily-stock-line-bot.yml
     with:
       allow_latest_available_data: 'true'

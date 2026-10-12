@@ -23,9 +23,11 @@ from urllib.request import Request, urlopen
 try:
     from scripts.market_calendar import expected_trade_date, is_trading_day
     from scripts.financial_metrics import canonical_period, financial_period, update_period_history, derive_financial_metrics, fill_valuation_estimates, number
+    from scripts.financial_journal import sync_financial_journal
 except ModuleNotFoundError:
     from market_calendar import expected_trade_date, is_trading_day
     from financial_metrics import canonical_period, financial_period, update_period_history, derive_financial_metrics, fill_valuation_estimates, number
+    from financial_journal import sync_financial_journal
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -935,6 +937,11 @@ def fetch_financial_sector_balances() -> list[StockRow]:
 def fetch_mops_financial_quality_map() -> dict[str, StockRow]:
     previous_quality = read_cache("financial_quality_raw") or {}
     ledger = read_cache("financial_period_history") or {}
+    durable = sync_financial_journal()
+    for sid, periods in durable.get("stocks", {}).items():
+        local = ledger.setdefault("stocks", {}).setdefault(sid, {})
+        for period, record in periods.items():
+            local.setdefault(period, record)
     income_map = read_cache("income_margins_raw") or {}
     try:
         summary_rows = fetch_mops_csv_rows(MOPS_FINANCIAL_SUMMARY_CSV_URL, "listed") + fetch_mops_csv_rows(
@@ -1006,6 +1013,7 @@ def fetch_mops_financial_quality_map() -> dict[str, StockRow]:
     comparison_count = sum(bool(row.get("eps_comparison_available")) for row in quality.values())
     DATA_SOURCE_STATUS["financial_quality"] = f"MOPS EPS/ROE rows={len(quality)} eps_yoy={comparison_count}"
     write_cache("financial_period_history", ledger)
+    sync_financial_journal(ledger)
     write_cache("financial_quality_raw", quality)
     return quality
 
