@@ -85,7 +85,7 @@ class FinancialMetricsTests(unittest.TestCase):
 
     def test_stale_official_ratios_are_not_used(self):
         rows = [{'Date': '20261008', 'Code': '2330', 'PEratio': '20', 'PBratio': '5'}]
-        with patch.object(bot, 'read_cache', return_value={}), patch.object(bot, 'write_cache'), patch.object(bot, 'fetch_with_retry', side_effect=[rows, []]):
+        with patch.object(bot, 'read_cache', return_value={}), patch.object(bot, 'write_cache'), patch.object(bot, 'fetch_dated_official_valuations', return_value={}), patch.object(bot, 'fetch_with_retry', side_effect=[rows, []]):
             self.assertEqual(bot.fetch_official_valuation_map('20261012'), {})
 
     def test_unknown_period_and_missing_values_do_not_create_ratios(self):
@@ -139,6 +139,21 @@ class FinancialMetricsTests(unittest.TestCase):
         with patch.object(bot, 'read_cache_record', return_value={'payload': []}), patch.object(bot, 'cache_age_hours', return_value=1), patch.object(bot, 'request_json') as request:
             bot.fetch_financial_sector_balances()
         request.assert_not_called()
+
+    def test_dated_query_supplies_current_values_when_daily_file_lags(self):
+        payload = {'date': '20261012', 'fields': ['證券代號', '本益比', '股價淨值比'], 'data': [['2330', '20', '5']]}
+        with patch.object(bot, 'fetch_with_retry', return_value=payload):
+            result = bot.fetch_dated_official_valuations('TWSE', '20261012')
+        self.assertEqual(result['2330']['valuation_trade_date'], '20261012')
+        self.assertEqual(result['2330']['per_source'], 'TWSE')
+
+    def test_cached_verified_history_is_saved_even_if_mops_fetch_fails(self):
+        ledger = {'stocks': {'2330': {'2026Q2': {'eps': 8}}}}
+        cached = {'2330': {'financial_metrics_version': 2, 'eps': 8}}
+        with patch.object(bot, 'read_cache', side_effect=lambda key: ledger if key == 'financial_period_history' else cached if key == 'financial_quality_raw' else {}), patch.object(bot, 'sync_financial_journal', return_value={}) as journal, patch.object(bot, 'fetch_mops_csv_rows', side_effect=RuntimeError('timeout')):
+            result = bot.fetch_mops_financial_quality_map()
+        self.assertEqual(result['2330']['eps'], 8)
+        self.assertEqual(journal.call_args.args[0], ledger)
 
 
 if __name__ == '__main__':

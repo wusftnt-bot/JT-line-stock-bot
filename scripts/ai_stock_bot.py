@@ -653,6 +653,38 @@ def fetch_finmind_per_record(stock_id: str, days: int = 45) -> dict[str, float]:
     }
 
 
+def fetch_dated_official_valuations(label: str, trade_date: str) -> dict[str, StockRow]:
+    day = datetime.strptime(trade_date, "%Y%m%d")
+    url = "https://www.twse.com.tw/rwd/zh/afterTrading/BWIBBU_d" if label == "TWSE" else "https://www.tpex.org.tw/www/zh-tw/afterTrading/peQryDate"
+    payload = fetch_with_retry(url, params={"date": trade_date if label == "TWSE" else day.strftime("%Y/%m/%d"), "response": "json"}, tries=2, timeout=25)
+    if not isinstance(payload, dict) or normalize_market_date(payload.get("date")) != trade_date:
+        return {}
+    if label == "TWSE":
+        rows = [dict(zip(payload.get("fields", []), values)) for values in payload.get("data", [])]
+        code_field = "證券代號"
+    else:
+        rows = _table_rows(payload, "股票代號")
+        code_field = "股票代號"
+    result = {}
+    for item in rows:
+        if "本益比" not in item or "股價淨值比" not in item:
+            continue
+        sid = str(item.get(code_field) or "").strip()
+        if not re.fullmatch(r"\d{4}", sid):
+            continue
+        pe, pb = number(item["本益比"]), number(item["股價淨值比"])
+        result[sid] = {
+            "pe_ratio": pe if pe is not None and pe > 0 else None,
+            "pbr": pb if pb is not None and pb > 0 else None,
+            "per_source": label if pe is not None and pe > 0 else "",
+            "pbr_source": label if pb is not None and pb > 0 else "",
+            "official_per_missing": pe is None or pe <= 0,
+            "pe_ratio_estimated": False, "valuation_source": label,
+            "valuation_trade_date": trade_date, "valuation_endpoint": "dated_query",
+        }
+    return result
+
+
 def fetch_official_valuation_map(trade_date: str) -> dict[str, StockRow]:
     cached = read_cache(f"official_valuation_{trade_date}")
     values = dict(cached) if isinstance(cached, dict) else {}
@@ -661,11 +693,11 @@ def fetch_official_valuation_map(trade_date: str) -> dict[str, StockRow]:
         ("TWSE", "https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_d", "Code", "PEratio", "PBratio"),
         ("TPEx", "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis", "SecuritiesCompanyCode", "PriceEarningRatio", "PriceBookRatio"),
     ):
+        matched = 0
         try:
             rows = fetch_with_retry(url, tries=2, timeout=25)
             if not isinstance(rows, list):
                 raise ValueError("Official valuation schema is not a list")
-            matched = 0
             for item in rows:
                 if normalize_market_date(item.get("Date")) != trade_date:
                     continue
@@ -689,6 +721,14 @@ def fetch_official_valuation_map(trade_date: str) -> dict[str, StockRow]:
                 failures.append(f"{label}_date_not_ready")
         except Exception as error:
             failures.append(f"{label}_{type(error).__name__}")
+        if not matched:
+            try:
+                dated = fetch_dated_official_valuations(label, trade_date)
+                values.update(dated)
+                if dated:
+                    failures = [value for value in failures if not value.startswith(label + "_")]
+            except Exception as error:
+                failures.append(f"{label}_dated_{type(error).__name__}")
     if values:
         write_cache(f"official_valuation_{trade_date}", values)
     DATA_SOURCE_STATUS["official_valuation"] = f"rows={len(values)} date={trade_date} failures={','.join(failures) or 'none'}"
@@ -942,6 +982,8 @@ def fetch_mops_financial_quality_map() -> dict[str, StockRow]:
         local = ledger.setdefault("stocks", {}).setdefault(sid, {})
         for period, record in periods.items():
             local.setdefault(period, record)
+    if ledger.get("stocks"):
+        sync_financial_journal(ledger)
     income_map = read_cache("income_margins_raw") or {}
     try:
         summary_rows = fetch_mops_csv_rows(MOPS_FINANCIAL_SUMMARY_CSV_URL, "listed") + fetch_mops_csv_rows(
